@@ -1,13 +1,17 @@
 package coreutils
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	"gobox/applets"
+	"syscall"
 )
 
 func init() {
@@ -31,26 +35,114 @@ func init() {
 }
 
 func catMain(args []string) int {
-	if len(args) < 2 {
-		// Read from stdin
-		_, err := io.Copy(os.Stdout, os.Stdin)
-		if err != nil {
-			return 1
-		}
-		return 0
-	}
+	number := false
+	numberNonBlank := false
+	showEnds := false
+	showTabs := false
+	squeezeBlank := false
+	showNonprint := false
+	paths := []string{}
 
-	exitCode := 0
-	for _, path := range args[1:] {
-		f, err := os.Open(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "gobox: cat: %s: %v\n", path, err)
-			exitCode = 1
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") {
+			paths = append(paths, arg)
 			continue
 		}
-		_, err = io.Copy(os.Stdout, f)
-		f.Close()
-		if err != nil {
+		if arg == "--" {
+			paths = append(paths, args[i+1:]...)
+			break
+		}
+		for _, c := range arg[1:] {
+			switch c {
+			case 'n':
+				number = true
+			case 'b':
+				numberNonBlank = true
+			case 'E':
+				showEnds = true
+			case 'T':
+				showTabs = true
+			case 's':
+				squeezeBlank = true
+			case 'v':
+				showNonprint = true
+			}
+		}
+	}
+
+	readers := []io.Reader{os.Stdin}
+	if len(paths) > 0 {
+		readers = nil
+		for _, path := range paths {
+			f, err := os.Open(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "gobox: cat: %s: %v\n", path, err)
+				continue
+			}
+			defer f.Close()
+			readers = append(readers, f)
+		}
+	}
+
+	lineNum := 1
+	prevBlank := false
+	exitCode := 0
+
+	for _, r := range readers {
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			line := scanner.Text()
+			blank := strings.TrimSpace(line) == ""
+
+			if squeezeBlank && blank && prevBlank {
+				continue
+			}
+			prevBlank = blank
+
+			showNum := false
+			if number {
+				showNum = true
+			}
+			if numberNonBlank && !blank {
+				showNum = true
+			}
+
+			if showTabs {
+				line = strings.ReplaceAll(line, "\t", "^I")
+			}
+			if showEnds {
+				line += "$"
+			}
+			if showNonprint {
+				// Replace non-printable chars
+				var b strings.Builder
+				for _, r := range line {
+					if r < 32 && r != '\t' {
+						b.WriteByte('^')
+						b.WriteByte(byte(r + 64))
+					} else if r == 127 {
+						b.WriteString("^?")
+					} else if r > 127 && r < 160 {
+						b.WriteByte('M')
+						b.WriteByte('-')
+						b.WriteByte('^')
+						b.WriteByte(byte(r - 64))
+					} else {
+						b.WriteRune(r)
+					}
+				}
+				line = b.String()
+			}
+
+			if showNum {
+				fmt.Printf("%6d\t%s\n", lineNum, line)
+				lineNum++
+			} else {
+				fmt.Println(line)
+			}
+		}
+		if err := scanner.Err(); err != nil {
 			exitCode = 1
 		}
 	}
@@ -521,34 +613,284 @@ func chgrpMain(args []string) int {
 }
 
 func lsMain(args []string) int {
-	targets := args[1:]
+	long := false
+	all := false
+	human := false
+	recursive := false
+	reverse := false
+	sortTime := false
+	sortSize := false
+	oneLine := false
+	targets := []string{}
+
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") {
+			targets = append(targets, arg)
+			continue
+		}
+		if arg == "--" {
+			targets = append(targets, args[i+1:]...)
+			break
+		}
+		for _, c := range arg[1:] {
+			switch c {
+			case 'l':
+				long = true
+			case 'a':
+				all = true
+			case 'h':
+				human = true
+			case 'R':
+				recursive = true
+			case 'r':
+				reverse = true
+			case 't':
+				sortTime = true
+			case 'S':
+				sortSize = true
+			case '1':
+				oneLine = true
+			case 'd':
+				// List directory entries, not contents
+			}
+		}
+	}
+
 	if len(targets) == 0 {
 		targets = []string{"."}
 	}
 
 	exitCode := 0
+	first := true
 	for _, path := range targets {
-		entries, err := os.ReadDir(path)
+		info, err := os.Stat(path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gobox: ls: cannot access '%s': %v\n", path, err)
 			exitCode = 1
 			continue
 		}
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
+		if !info.IsDir() {
+			// Single file
+			if long {
+				fmt.Println(formatFileInfo(path, info, human))
+			} else {
+				fmt.Println(info.Name())
+			}
+			continue
 		}
-		if len(targets) > 1 {
-			fmt.Printf("%s:\n", path)
-		}
-		for _, name := range names {
-			fmt.Println(name)
-		}
-		if len(targets) > 1 {
-			fmt.Println()
+
+		err = lsDir(path, "", long, all, human, recursive, reverse, sortTime, sortSize, oneLine, &first, len(targets) > 1)
+		if err != nil {
+			exitCode = 1
 		}
 	}
 	return exitCode
+}
+
+func lsDir(dirPath, prefix string, long, all, human, recursive, reverse, sortTime, sortSize, oneLine bool, first *bool, showHeader bool) error {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: ls: cannot access '%s': %v\n", dirPath, err)
+		return err
+	}
+
+	type entry struct {
+		name string
+		info os.FileInfo
+	}
+	var list []entry
+	for _, e := range entries {
+		if !all && strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		list = append(list, entry{e.Name(), info})
+	}
+
+	if sortTime {
+		sort.Slice(list, func(i, j int) bool {
+			return list[i].info.ModTime().Before(list[j].info.ModTime())
+		})
+	} else if sortSize {
+		sort.Slice(list, func(i, j int) bool {
+			return list[i].info.Size() < list[j].info.Size()
+		})
+	} else {
+		sort.Slice(list, func(i, j int) bool {
+			return list[i].name < list[j].name
+		})
+	}
+
+	if reverse {
+		for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
+			list[i], list[j] = list[j], list[i]
+		}
+	}
+
+	displayPath := dirPath
+	if prefix != "" {
+		displayPath = prefix
+	}
+	if showHeader && !*first {
+		fmt.Println()
+	}
+	if showHeader || prefix != "" {
+		fmt.Printf("%s:\n", displayPath)
+		*first = false
+	}
+
+	if long {
+		for _, e := range list {
+			fmt.Println(formatFileInfo(filepath.Join(dirPath, e.name), e.info, human))
+		}
+	} else {
+		// Column output
+		names := make([]string, len(list))
+		for i, e := range list {
+			names[i] = e.name
+		}
+		if oneLine {
+			for _, n := range names {
+				fmt.Println(n)
+			}
+		} else {
+			printFileColumns(names)
+		}
+	}
+
+	if recursive {
+		for _, e := range list {
+			if e.info.IsDir() {
+				subPrefix := filepath.Join(dirPath, e.name)
+				lsDir(filepath.Join(dirPath, e.name), subPrefix, long, all, human, recursive, reverse, sortTime, sortSize, oneLine, first, true)
+			}
+		}
+	}
+	return nil
+}
+
+func formatFileInfo(path string, info os.FileInfo, human bool) string {
+	mode := info.Mode()
+	size := info.Size()
+	sizeStr := ""
+	if human {
+		sizeStr = humanSize(size)
+	} else {
+		sizeStr = fmt.Sprintf("%d", size)
+	}
+
+	// Get link target for symlinks
+	linkTarget := ""
+	if mode&os.ModeSymlink != 0 {
+		if target, err := os.Readlink(path); err == nil {
+			linkTarget = " -> " + target
+		}
+	}
+
+	// Get owner info from stat
+	var stat syscall.Stat_t
+	uid := -1
+	gid := -1
+	if err := syscall.Stat(path, &stat); err == nil {
+		uid = int(stat.Uid)
+		gid = int(stat.Gid)
+	}
+
+	owner := userName(uid)
+	group := groupName(gid)
+
+	modTime := info.ModTime().Format("Jan _2 15:04")
+	return fmt.Sprintf("%s %3d %-8s %-8s %8s %s %s%s",
+		mode.String(), 1, owner, group, sizeStr, modTime, info.Name(), linkTarget)
+}
+
+func humanSize(size int64) string {
+	units := []string{"", "K", "M", "G", "T"}
+	idx := 0
+	f := float64(size)
+	for f >= 1024 && idx < len(units)-1 {
+		f /= 1024
+		idx++
+	}
+	if idx == 0 {
+		return fmt.Sprintf("%d", size)
+	}
+	return fmt.Sprintf("%.1f%s", f, units[idx])
+}
+
+func printFileColumns(names []string) {
+	cols := 80
+	colWidth := 24
+	nCols := cols / colWidth
+	if nCols == 0 {
+		nCols = 1
+	}
+	nRows := (len(names) + nCols - 1) / nCols
+	for row := 0; row < nRows; row++ {
+		for col := 0; col < nCols; col++ {
+			i := col*nRows + row
+			if i >= len(names) {
+				continue
+			}
+			fmt.Print(names[i])
+			if col < nCols-1 {
+				padding := colWidth - len(names[i])
+				if padding < 1 {
+					padding = 1
+				}
+				for k := 0; k < padding; k++ {
+					fmt.Print(" ")
+				}
+			}
+		}
+		fmt.Println()
+	}
+}
+
+func userName(uid int) string {
+	if uid == 0 {
+		return "root"
+	}
+	if uid < 1000 {
+		return fmt.Sprintf("%d", uid)
+	}
+	data, _ := os.ReadFile("/etc/passwd")
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.Split(line, ":")
+		if len(parts) >= 3 {
+			var u int
+			fmt.Sscanf(parts[2], "%d", &u)
+			if u == uid {
+				return parts[0]
+			}
+		}
+	}
+	return strconv.Itoa(uid)
+}
+
+func groupName(gid int) string {
+	if gid == 0 {
+		return "root"
+	}
+	if gid < 1000 {
+		return fmt.Sprintf("%d", gid)
+	}
+	data, _ := os.ReadFile("/etc/group")
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.Split(line, ":")
+		if len(parts) >= 3 {
+			var g int
+			fmt.Sscanf(parts[2], "%d", &g)
+			if g == gid {
+				return parts[0]
+			}
+		}
+	}
+	return strconv.Itoa(gid)
 }
 
 func dirnameMain(args []string) int {

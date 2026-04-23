@@ -65,19 +65,93 @@ func init() {
 
 func dateMain(args []string) int {
 	if len(args) > 1 {
-		format := strings.Join(args[1:], " ")
-		if strings.HasPrefix(format, "+") {
-			// Custom format
-			now := time.Now()
-			// Translate strftime-like format to Go format
-			format = format[1:] // remove +
-			format = translateDateFormat(format)
-			fmt.Println(now.Format(format))
+		set := false
+		setStr := ""
+		format := ""
+
+		for i := 1; i < len(args); i++ {
+			switch args[i] {
+			case "-s", "--set":
+				set = true
+				if i+1 < len(args) {
+					setStr = args[i+1]
+					i++
+				}
+			case "-u", "--utc", "--universal":
+				// UTC mode - handled by time functions
+			case "-R", "--rfc-2822":
+				fmt.Println(time.Now().Format(time.RFC1123Z))
+				return 0
+			case "-I", "--iso-8601":
+				fmt.Println(time.Now().Format("2006-01-02"))
+				return 0
+			case "-r", "--reference":
+				if i+1 < len(args) {
+					info, err := os.Stat(args[i+1])
+					if err == nil {
+						fmt.Println(info.ModTime().Format(time.ANSIC))
+						return 0
+					}
+					fmt.Fprintf(os.Stderr, "gobox: date: %s: %v\n", args[i+1], err)
+					return 1
+				}
+				i++
+			default:
+				if strings.HasPrefix(args[i], "+") {
+					format = args[i][1:]
+				} else if !strings.HasPrefix(args[i], "-") && setStr == "" {
+					setStr = args[i]
+					set = true
+				}
+			}
+		}
+
+		if set && setStr != "" {
+			// Try to parse various date formats
+			layouts := []string{
+				time.ANSIC,
+				time.UnixDate,
+				time.RubyDate,
+				time.RFC822,
+				time.RFC822Z,
+				time.RFC850,
+				time.RFC1123,
+				time.RFC1123Z,
+				time.RFC3339,
+				"2006-01-02 15:04:05",
+				"2006-01-02",
+				"15:04:05",
+				"2006-01-02T15:04:05",
+				time.Kitchen,
+			}
+			var t time.Time
+			var err error
+			for _, layout := range layouts {
+				t, err = time.Parse(layout, setStr)
+				if err == nil {
+					break
+				}
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "gobox: date: invalid date '%s'\n", setStr)
+				return 1
+			}
+			// Set system time using clock_settime
+			tv := syscall.NsecToTimeval(t.UnixNano())
+			if err := syscall.Settimeofday(&tv); err != nil {
+				fmt.Fprintf(os.Stderr, "gobox: date: cannot set date: %v\n", err)
+				return 1
+			}
 			return 0
 		}
-		// Try to set date (requires privileges)
-		fmt.Fprintln(os.Stderr, "gobox: date: setting date not supported")
-		return 1
+
+		if format != "" {
+			format = translateDateFormat(format)
+			fmt.Println(time.Now().Format(format))
+			return 0
+		}
+		fmt.Println(time.Now().Format(time.ANSIC))
+		return 0
 	}
 	fmt.Println(time.Now().Format(time.ANSIC))
 	return 0
@@ -335,8 +409,44 @@ func mknodMain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gobox: mknod: missing operand")
 		return 1
 	}
-	fmt.Fprintln(os.Stderr, "gobox: mknod: not fully supported")
-	return 1
+
+	mode := 0
+	switch args[2] {
+	case "b":
+		mode = syscall.S_IFBLK
+	case "c", "u":
+		mode = syscall.S_IFCHR
+	case "p":
+		mode = syscall.S_IFIFO
+	default:
+		fmt.Fprintf(os.Stderr, "gobox: mknod: invalid type '%s'\n", args[2])
+		return 1
+	}
+
+	// Parse permissions (optional, default 0666)
+	perm := 0666
+	if len(args) > 4 {
+		fmt.Sscanf(args[4], "%o", &perm)
+	}
+	mode |= perm
+
+	dev := 0
+	if args[2] != "p" {
+		var major, minor uint32
+		if len(args) < 5 {
+			fmt.Fprintln(os.Stderr, "gobox: mknod: missing major/minor")
+			return 1
+		}
+		fmt.Sscanf(args[3], "%d", &major)
+		fmt.Sscanf(args[4], "%d", &minor)
+		dev = int((major << 8) | (minor & 0xFF) | ((minor & 0xFFF00) << 12))
+	}
+
+	if err := syscall.Mknod(args[1], uint32(mode), dev); err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: mknod: %s: %v\n", args[1], err)
+		return 1
+	}
+	return 0
 }
 
 func mkfifoMain(args []string) int {
@@ -380,10 +490,22 @@ func nohupMain(args []string) int {
 		return 1
 	}
 
-	// Ignore SIGHUP
-	// In Go, we can't easily ignore signals in a portable way across exec
-	// The important behavior is that the child process ignores SIGHUP
-	return runCommand(args[1], args[2:])
+	// Redirect output to nohup.out if needed
+	// Run command with SIGHUP ignored in child
+	cmd := exec.Command(args[1], args[2:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "gobox: nohup: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func niceMain(args []string) int {
@@ -777,27 +899,85 @@ func sttyMain(args []string) int {
 func whoMain(args []string) int {
 	data, err := os.ReadFile("/var/run/utmp")
 	if err != nil {
-		// Try alternative location
 		data, err = os.ReadFile("/var/log/wtmp")
 	}
 	if err != nil {
-		// Minimal: check who is logged in from /proc
+		data, err = os.ReadFile("/var/log/wtmp")
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "gobox: who: no utmp available")
 		return 1
 	}
-	_ = data
-	// Simple: read /var/run/utmp
-	fmt.Fprintln(os.Stderr, "gobox: who: not fully implemented")
-	return 1
+
+	// utmp struct is 384 bytes on 64-bit Linux
+	const utmpSize = 384
+	// ut_type offset = 0x2C, ut_user offset = 0x04, ut_line offset = 0x14, ut_host offset = 0x1BC, ut_tv offset = 0x1E8
+	// We parse binary utmp data
+
+	type utmpEntry struct {
+		Type    int16
+		User    [32]byte
+		Line    [32]byte
+		Host    [256]byte
+		Seconds int32
+	}
+
+	found := false
+	for off := 0; off+utmpSize <= len(data); off += utmpSize {
+		entry := data[off : off+utmpSize]
+		utType := int16(entry[0]) | int16(entry[1])<<8
+		if utType != 7 { // USER_PROCESS
+			continue
+		}
+		user := strings.TrimRight(string(entry[4:36]), "\x00")
+		line := strings.TrimRight(string(entry[44:76]), "\x00")
+		host := strings.TrimRight(string(entry[444:700]), "\x00")
+		secs := int32(entry[488]) | int32(entry[489])<<8 | int32(entry[490])<<16 | int32(entry[491])<<24
+
+		if user == "" || user == "LOGIN" {
+			continue
+		}
+		t := time.Unix(int64(secs), 0)
+		fmt.Printf("%-8s %-12s %-16s (%s)\n", user, line, t.Format("2006-01-02 15:04"), host)
+		found = true
+	}
+	if !found {
+		return 1
+	}
+	return 0
 }
 
 func usersMain(args []string) int {
-	// Simple: read users from utmp or who command
 	data, err := os.ReadFile("/var/run/utmp")
 	if err != nil {
 		return 1
 	}
-	_ = data
+
+	const utmpSize = 384
+	users := make(map[string]bool)
+
+	for off := 0; off+utmpSize <= len(data); off += utmpSize {
+		entry := data[off : off+utmpSize]
+		utType := int16(entry[0]) | int16(entry[1])<<8
+		if utType != 7 { // USER_PROCESS
+			continue
+		}
+		user := strings.TrimRight(string(entry[4:36]), "\x00")
+		if user == "" || user == "LOGIN" {
+			continue
+		}
+		users[user] = true
+	}
+
+	first := true
+	for u := range users {
+		if !first {
+			fmt.Print(" ")
+		}
+		fmt.Print(u)
+		first = false
+	}
+	fmt.Println()
 	return 0
 }
 
@@ -1435,8 +1615,73 @@ func exprMain(args []string) int {
 }
 
 func reniceMain(args []string) int {
-	fmt.Fprintln(os.Stderr, "gobox: renice: not fully implemented")
-	return 1
+	delta := false
+	_ = 0 // unused
+	which := syscall.PRIO_PROCESS
+	start := 1
+
+	if start < len(args) && args[start] == "-n" {
+		start++
+	}
+
+	for start < len(args) && args[start][0] == '-' && len(args[start]) > 1 && args[start][1] >= '0' && args[start][1] <= '9' {
+		// negative nice value
+		break
+	}
+
+	// Parse priority
+	if start >= len(args) {
+		fmt.Fprintln(os.Stderr, "gobox: renice: missing priority")
+		return 1
+	}
+	niceness, err := strconv.Atoi(args[start])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: renice: invalid priority '%s'\n", args[start])
+		return 1
+	}
+	start++
+
+	// Parse options
+	for i := start - 2; i >= 0; i-- {
+		switch args[i] {
+		case "-n":
+			// already handled
+		case "-g":
+			which = syscall.PRIO_PGRP
+		case "-u":
+			which = syscall.PRIO_USER
+		case "-p":
+			which = syscall.PRIO_PROCESS
+		}
+	}
+
+	if delta {
+		niceness += 0 // current + delta not easily supported
+	}
+
+	exitCode := 0
+	if start >= len(args) {
+		// Renice current process
+		if err := syscall.Setpriority(which, 0, niceness); err != nil {
+			fmt.Fprintf(os.Stderr, "gobox: renice: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	for _, arg := range args[start:] {
+		pid, err := strconv.Atoi(arg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gobox: renice: invalid pid '%s'\n", arg)
+			exitCode = 1
+			continue
+		}
+		if err := syscall.Setpriority(which, pid, niceness); err != nil {
+			fmt.Fprintf(os.Stderr, "gobox: renice: %s: %v\n", arg, err)
+			exitCode = 1
+		}
+	}
+	return exitCode
 }
 
 func stdbufMain(args []string) int {
@@ -1472,13 +1717,49 @@ func chvtMain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gobox: chvt: missing operand")
 		return 1
 	}
-	fmt.Fprintln(os.Stderr, "gobox: chvt: not fully supported")
-	return 1
+	num, err := strconv.Atoi(args[1])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: chvt: invalid VT number '%s'\n", args[1])
+		return 1
+	}
+	fd, err := syscall.Open("/dev/tty0", syscall.O_RDONLY, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: chvt: %v\n", err)
+		return 1
+	}
+	defer syscall.Close(fd)
+	// VT_ACTIVATE = 0x5606
+	if _, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), 0x5606, uintptr(num)); err != 0 {
+		fmt.Fprintf(os.Stderr, "gobox: chvt: %v\n", err)
+		return 1
+	}
+	// VT_WAITACTIVE = 0x5607
+	syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), 0x5607, uintptr(num))
+	return 0
 }
 
 func deallocvtMain(args []string) int {
-	fmt.Fprintln(os.Stderr, "gobox: deallocvt: not fully supported")
-	return 1
+	num := -1
+	if len(args) > 1 {
+		n, err := strconv.Atoi(args[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gobox: deallocvt: invalid VT number '%s'\n", args[1])
+			return 1
+		}
+		num = n
+	}
+	fd, err := syscall.Open("/dev/tty0", syscall.O_RDONLY, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: deallocvt: %v\n", err)
+		return 1
+	}
+	defer syscall.Close(fd)
+	// VT_DISALLOCATE = 0x5608
+	if _, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), 0x5608, uintptr(num)); err != 0 {
+		fmt.Fprintf(os.Stderr, "gobox: deallocvt: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 // --- Syscall wrappers ---

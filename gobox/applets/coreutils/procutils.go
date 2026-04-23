@@ -5,8 +5,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"gobox/applets"
 	"syscall"
@@ -318,8 +320,156 @@ func dmesgMain(args []string) int {
 }
 
 func topMain(args []string) int {
-	// Simple one-shot top (like busybox top with -b -n 1)
-	return psMain(args)
+	batch := false
+	delay := 5
+	nIter := 0
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "-b":
+			batch = true
+		case "-d":
+			if i+1 < len(args) {
+				delay, _ = strconv.Atoi(args[i+1])
+				i++
+			}
+		case "-n":
+			if i+1 < len(args) {
+				nIter, _ = strconv.Atoi(args[i+1])
+				i++
+			}
+		case "-H":
+			// Threads mode
+		}
+	}
+
+	iter := 0
+	for {
+		if nIter > 0 && iter >= nIter {
+			break
+		}
+		iter++
+
+		memTotal, memFree, _ := getMemInfo()
+		loadData, _ := os.ReadFile("/proc/loadavg")
+		loadAvg := "0.00 0.00 0.00"
+		if loadData != nil {
+			parts := strings.Fields(string(loadData))
+			if len(parts) >= 3 {
+				loadAvg = strings.Join(parts[:3], " ")
+			}
+		}
+
+		if !batch {
+			fmt.Print("\033[H\033[J")
+			fmt.Printf("top - %s up %s, load average: %s\n",
+				time.Now().Format("15:04:05"),
+				getUptime(), loadAvg)
+			fmt.Printf("Mem: %6dK total, %6dK free\n", memTotal, memFree)
+			fmt.Println("  PID  PPID  VSZ     RSS     S  COMMAND")
+		}
+
+		entries, _ := os.ReadDir("/proc")
+		type procEntry struct {
+			pid  int
+			ppid int
+			vsz  int64
+			rss  int64
+			stat byte
+			cmd  string
+		}
+		var procs []procEntry
+
+		for _, entry := range entries {
+			pid, err := strconv.Atoi(entry.Name())
+			if err != nil {
+				continue
+			}
+			status, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
+			if err != nil {
+				continue
+			}
+			statData, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+			if err != nil {
+				continue
+			}
+
+			var pe procEntry
+			pe.pid = pid
+
+			for _, line := range strings.Split(string(status), "\n") {
+				if strings.HasPrefix(line, "Name:") {
+					pe.cmd = strings.TrimSpace(strings.TrimPrefix(line, "Name:"))
+				}
+				if strings.HasPrefix(line, "PPid:") {
+					fmt.Sscanf(strings.TrimPrefix(line, "PPid:"), "%d", &pe.ppid)
+				}
+				if strings.HasPrefix(line, "VmSize:") {
+					fmt.Sscanf(strings.TrimPrefix(line, "VmSize:"), "%d", &pe.vsz)
+				}
+				if strings.HasPrefix(line, "VmRSS:") {
+					fmt.Sscanf(strings.TrimPrefix(line, "VmRSS:"), "%d", &pe.rss)
+				}
+			}
+
+			parenEnd := strings.LastIndex(string(statData), ")")
+			if parenEnd > 0 && parenEnd+2 < len(statData) {
+				pe.stat = statData[parenEnd+2]
+			}
+
+			procs = append(procs, pe)
+		}
+
+		sort.Slice(procs, func(i, j int) bool {
+			return procs[i].pid < procs[j].pid
+		})
+
+		for _, p := range procs {
+			if p.cmd == "" {
+				continue
+			}
+			fmt.Printf("%5d  %5d  %6d  %6d  %c  %s\n",
+				p.pid, p.ppid, p.vsz, p.rss, p.stat, p.cmd)
+		}
+
+		if batch {
+			break
+		}
+		time.Sleep(time.Duration(delay) * time.Second)
+	}
+	return 0
+}
+
+func getUptime() string {
+	data, _ := os.ReadFile("/proc/uptime")
+	if data == nil {
+		return "?"
+	}
+	var secs float64
+	fmt.Sscanf(string(data), "%f", &secs)
+	days := int(secs / 86400)
+	hours := int(secs/3600) % 24
+	mins := int(secs/60) % 60
+	if days > 0 {
+		return fmt.Sprintf("%d days, %02d:%02d", days, hours, mins)
+	}
+	return fmt.Sprintf("%02d:%02d", hours, mins)
+}
+
+func getMemInfo() (total, free int64, _ error) {
+	data, _ := os.ReadFile("/proc/meminfo")
+	if data == nil {
+		return 0, 0, fmt.Errorf("cannot read /proc/meminfo")
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "MemTotal:") {
+			fmt.Sscanf(line, "MemTotal: %d kB", &total)
+		}
+		if strings.HasPrefix(line, "MemFree:") {
+			fmt.Sscanf(line, "MemFree: %d kB", &free)
+		}
+	}
+	return
 }
 
 type procInfo struct {

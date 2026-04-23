@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha3"
 	"crypto/sha512"
 	"fmt"
 	"hash"
@@ -939,8 +940,6 @@ func bsdSum(data []byte) int {
 	return s
 }
 
-// sha3New creates a SHA3-256 hash. Since Go's standard library
-// doesn't include SHA3 in crypto, we use a simple fallback.
 func sha3New() hash.Hash {
-	return sha256.New()
+	return sha3.New256()
 }

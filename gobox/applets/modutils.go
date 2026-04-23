@@ -3,10 +3,13 @@ package applets
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"syscall"
+	"unsafe"
 )
 
 func init() {
@@ -43,9 +46,9 @@ func insmodMain(args []string) int {
 
 	// Use init_module syscall
 	_, _, errno := syscall.Syscall(syscall.SYS_INIT_MODULE,
-		uintptr(0), // module image pointer
+		uintptr(unsafe.Pointer(&data[0])),
 		uintptr(len(data)),
-		0) // options
+		0)
 	if errno != 0 {
 		fmt.Fprintf(os.Stderr, "gobox: insmod: %s: %v\n", path, errno)
 		return 1
@@ -61,8 +64,9 @@ func rmmodMain(args []string) int {
 
 	moduleName := args[1]
 	// Use delete_module syscall
+	nameBytes := append([]byte(moduleName), 0)
 	_, _, errno := syscall.Syscall(syscall.SYS_DELETE_MODULE,
-		uintptr(0), // module name pointer
+		uintptr(unsafe.Pointer(&nameBytes[0])),
 		syscall.O_NONBLOCK,
 		0)
 	if errno != 0 {
@@ -189,6 +193,71 @@ func modinfoMain(args []string) int {
 }
 
 func depmodMain(args []string) int {
-	fmt.Fprintln(os.Stderr, "gobox: depmod: not fully implemented")
-	return 1
+	// Determine kernel release
+	release, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		// Try uname -r
+		cmd := exec.Command("uname", "-r")
+		out, err := cmd.Output()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gobox: depmod: cannot determine kernel version")
+			return 1
+		}
+		release = out
+	}
+	kver := strings.TrimSpace(string(release))
+	modDir := filepath.Join("/lib/modules", kver)
+
+	// Scan for .ko files and extract dependencies
+	modules := make(map[string][]string)
+	filepath.Walk(modDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".ko") {
+			return nil
+		}
+		relPath, _ := filepath.Rel(modDir, path)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		// Extract depends= from modinfo strings
+		var deps []string
+		for _, s := range strings.Split(string(data), "\x00") {
+			if strings.HasPrefix(s, "depends=") {
+				depStr := strings.TrimPrefix(s, "depends=")
+				if depStr != "" {
+					deps = strings.Split(depStr, ",")
+				}
+				break
+			}
+		}
+		modules[relPath] = deps
+		return nil
+	})
+
+	// Write modules.dep
+	depPath := filepath.Join(modDir, "modules.dep")
+	var lines []string
+	for _, mod := range sortedKeys(modules) {
+		deps := modules[mod]
+		line := mod + ":"
+		for _, d := range deps {
+			line += " " + d
+		}
+		lines = append(lines, line)
+	}
+	output := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(depPath, []byte(output), 0644); err != nil {
+		// If we can't write, just print to stdout
+		os.Stdout.WriteString(output)
+	}
+	return 0
+}
+
+func sortedKeys(m map[string][]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

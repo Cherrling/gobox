@@ -58,6 +58,50 @@ func RunByName(name string, args []string) int {
 	return a.Run(args)
 }
 
+// printColumns prints a list of strings in aligned columns.
+func printColumns(items []string, colWidth int) {
+	if len(items) == 0 {
+		return
+	}
+	// Determine terminal width
+	cols := 80
+	if w, err := os.Stdout.Stat(); err == nil && (w.Mode()&os.ModeCharDevice) != 0 {
+		if w, _, err := getTerminalSize(); err == nil && w > 0 {
+			cols = w
+		}
+	}
+	nCols := cols / colWidth
+	if nCols == 0 {
+		nCols = 1
+	}
+	nRows := (len(items) + nCols - 1) / nCols
+	for row := 0; row < nRows; row++ {
+		for col := 0; col < nCols; col++ {
+			i := col*nRows + row
+			if i >= len(items) {
+				continue
+			}
+			fmt.Print(items[i])
+			if col < nCols-1 {
+				padding := colWidth - len(items[i])
+				if padding < 1 {
+					padding = 1
+				}
+				for k := 0; k < padding; k++ {
+					fmt.Print(" ")
+				}
+			}
+		}
+		fmt.Println()
+	}
+}
+
+// getTerminalSize returns the terminal width and height.
+// It returns 0, 0, error if not a terminal.
+func getTerminalSize() (int, int, error) {
+	return 0, 0, fmt.Errorf("not supported")
+}
+
 // Dispatch determines which applet to run based on argv[0] and the arguments.
 func Dispatch(args []string) int {
 	if len(args) == 0 {
@@ -72,9 +116,7 @@ func Dispatch(args []string) int {
 		if len(args) >= 2 {
 			sub := args[1]
 			if sub == "--list" || sub == "-l" {
-				for _, name := range List() {
-					fmt.Println(name)
-				}
+				printColumns(List(), 8)
 				return 0
 			}
 			if !strings.HasPrefix(sub, "-") {
@@ -86,9 +128,7 @@ func Dispatch(args []string) int {
 		fmt.Println("Usage: gobox [APPLET] [ARGS]...")
 		fmt.Println()
 		fmt.Println("Available applets:")
-		for _, name := range List() {
-			fmt.Printf("  %s\n", name)
-		}
+		printColumns(List(), 20)
 		return 0
 	}
 

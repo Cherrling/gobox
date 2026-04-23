@@ -487,8 +487,69 @@ func setsidMain(args []string) int {
 }
 
 func flockMain(args []string) int {
-	fmt.Fprintln(os.Stderr, "gobox: flock: not fully implemented")
-	return 1
+	shared := false
+	unlock := false
+	nonblock := false
+	cmdIndex := -1
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "-s", "--shared":
+			shared = true
+		case "-u", "--unlock":
+			unlock = true
+		case "-n", "--nb", "--nonblock":
+			nonblock = true
+		default:
+			if !strings.HasPrefix(args[i], "-") {
+				cmdIndex = i
+				break
+			}
+			fmt.Fprintf(os.Stderr, "gobox: flock: unknown option: %s\n", args[i])
+			return 1
+		}
+		if cmdIndex > 0 {
+			break
+		}
+	}
+
+	if cmdIndex < 1 || cmdIndex >= len(args) {
+		fmt.Fprintln(os.Stderr, "gobox: flock: missing file descriptor or file")
+		return 1
+	}
+
+	fdPath := args[cmdIndex]
+	cmdArgs := args[cmdIndex+1:]
+
+	f, err := os.Open(fdPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: flock: %s: %v\n", fdPath, err)
+		return 1
+	}
+	defer f.Close()
+
+	operation := syscall.LOCK_EX
+	if shared {
+		operation = syscall.LOCK_SH
+	}
+	if unlock {
+		operation = syscall.LOCK_UN
+	}
+	if nonblock {
+		operation |= syscall.LOCK_NB
+	}
+
+	if err := syscall.Flock(int(f.Fd()), operation); err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: flock: %v\n", err)
+		return 1
+	}
+
+	if len(cmdArgs) == 0 {
+		return 0
+	}
+
+	// Run command while holding the lock
+	return runAppCommand(cmdArgs[0], cmdArgs[1:])
 }
 
 func revMain(args []string) int {

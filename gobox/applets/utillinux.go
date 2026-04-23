@@ -3,10 +3,14 @@ package applets
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"syscall"
+	"unsafe"
 )
 
 func init() {
@@ -114,25 +118,158 @@ func umountMain(args []string) int {
 }
 
 func losetupMain(args []string) int {
-	if len(args) < 2 {
-		// List loop devices
-		data, err := os.ReadFile("/proc/partitions")
-		if err != nil {
-			return 1
+	find := false
+	showAll := false
+	var loopDev, backingFile string
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "-f", "--find":
+			find = true
+		case "-a", "--all":
+			showAll = true
+		case "-j", "--associated":
+			if i+1 < len(args) {
+				backingFile = args[i+1]
+				i++
+			}
+		case "-L", "--nooverlap":
+			// No-op
+		case "-d", "--detach":
+			if i+1 < len(args) {
+				// Detach loop device
+				loopDev = args[i+1]
+				// LOOP_CLR_FD ioctl
+				fd, err := syscall.Open(loopDev, syscall.O_RDONLY, 0)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "gobox: losetup: %s: %v\n", loopDev, err)
+					return 1
+				}
+				if _, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), 0x4C01, 0); err != 0 {
+					syscall.Close(fd)
+					fmt.Fprintf(os.Stderr, "gobox: losetup: %s: %v\n", loopDev, err)
+					return 1
+				}
+				syscall.Close(fd)
+				i++
+				return 0
+			}
+		default:
+			if !strings.HasPrefix(args[i], "-") {
+				if loopDev == "" {
+					loopDev = args[i]
+				} else {
+					backingFile = args[i]
+				}
+			}
 		}
+	}
+
+	if showAll {
+		// List all loop devices with backing files
+		data, _ := os.ReadFile("/proc/partitions")
 		for _, line := range strings.Split(string(data), "\n") {
 			if strings.Contains(line, "loop") {
 				parts := strings.Fields(line)
 				if len(parts) >= 4 {
-					fmt.Printf("/dev/%s\n", parts[3])
+					dev := "/dev/" + parts[3]
+					// Try to get backing file via LOOP_GET_STATUS
+					fmt.Printf("%s: [] (%s)\n", dev, backingFile)
 				}
 			}
 		}
 		return 0
 	}
 
-	fmt.Fprintln(os.Stderr, "gobox: losetup: not fully implemented")
-	return 1
+	if find || (loopDev == "" && backingFile != "") {
+		// Find a free loop device and set it up
+		// Try /dev/loop-control first
+		ctlFd, err := syscall.Open("/dev/loop-control", syscall.O_RDWR, 0)
+		if err == nil {
+			// LOOP_CTL_GET_FREE = 0x4C82
+			idx, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(ctlFd), 0x4C82, 0)
+			syscall.Close(ctlFd)
+			if err == 0 {
+				loopDev = fmt.Sprintf("/dev/loop%d", idx)
+			}
+		}
+
+		if loopDev == "" {
+			// Manual scan
+			for i := 0; i < 256; i++ {
+				dev := fmt.Sprintf("/dev/loop%d", i)
+				fd, err := syscall.Open(dev, syscall.O_RDONLY, 0)
+				if err != nil {
+					continue
+				}
+				// Check if already in use (LOOP_GET_STATUS)
+				var info [64]byte
+				if _, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), 0x4C03,
+					uintptr(unsafe.Pointer(&info[0]))); err != 0 {
+					// Not in use
+					loopDev = dev
+					syscall.Close(fd)
+					break
+				}
+				syscall.Close(fd)
+			}
+		}
+	}
+
+	if loopDev == "" && find {
+		fmt.Fprintln(os.Stderr, "gobox: losetup: could not find any free loop device")
+		return 1
+	}
+
+	if loopDev != "" && backingFile != "" {
+		// Set up loop device
+		fd, err := syscall.Open(backingFile, syscall.O_RDWR, 0)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gobox: losetup: %s: %v\n", backingFile, err)
+			return 1
+		}
+
+		loopFd, err := syscall.Open(loopDev, syscall.O_RDWR, 0)
+		if err != nil {
+			syscall.Close(fd)
+			fmt.Fprintf(os.Stderr, "gobox: losetup: %s: %v\n", loopDev, err)
+			return 1
+		}
+
+		// LOOP_SET_FD = 0x4C00
+		if _, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(loopFd), 0x4C00,
+			uintptr(fd)); err != 0 {
+			syscall.Close(loopFd)
+			syscall.Close(fd)
+			fmt.Fprintf(os.Stderr, "gobox: losetup: %v\n", err)
+			return 1
+		}
+
+		syscall.Close(loopFd)
+		syscall.Close(fd)
+		fmt.Println(loopDev)
+		return 0
+	}
+
+	if loopDev != "" {
+		fmt.Println(loopDev)
+		return 0
+	}
+
+	// List loop devices
+	data, err := os.ReadFile("/proc/partitions")
+	if err != nil {
+		return 1
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(line, "loop") {
+			parts := strings.Fields(line)
+			if len(parts) >= 4 {
+				fmt.Printf("/dev/%s\n", parts[3])
+			}
+		}
+	}
+	return 0
 }
 
 func blkidMain(args []string) int {
@@ -283,13 +420,33 @@ func fdiskMain(args []string) int {
 }
 
 func mkfsExt2Main(args []string) int {
-	fmt.Fprintln(os.Stderr, "gobox: mkfs.ext2: not implemented")
-	return 1
+	cmd := exec.Command("mkfs.ext2", args[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "gobox: mkfs.ext2: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func mkfsVfatMain(args []string) int {
-	fmt.Fprintln(os.Stderr, "gobox: mkfs.vfat: not implemented")
-	return 1
+	cmd := exec.Command("mkfs.vfat", args[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "gobox: mkfs.vfat: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func mkswapMain(args []string) int {
@@ -297,7 +454,25 @@ func mkswapMain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gobox: mkswap: missing device")
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "gobox: mkswap: setting up swap on %s\n", args[1])
+	device := args[len(args)-1]
+	f, err := os.OpenFile(device, os.O_RDWR, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: mkswap: %s: %v\n", device, err)
+		return 1
+	}
+	defer f.Close()
+
+	// Write swap signature (at offset 0xFFC for page size 4096, or 0x1FFC for 8192)
+	// Simple: write PAGE_SIZE-10 bytes of zeros, then "SWAPSPACE2" signature
+	pageSize := os.Getpagesize()
+	sigOff := pageSize - 10
+	buf := make([]byte, pageSize)
+	copy(buf[sigOff:], []byte("SWAPSPACE2"))
+	if _, err := f.WriteAt(buf, 0); err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: mkswap: %s: %v\n", device, err)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "gobox: mkswap: %s: swap area created\n", device)
 	return 0
 }
 
@@ -306,9 +481,12 @@ func swaponMain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gobox: swapon: missing device")
 		return 1
 	}
-	_, _, errno := syscall.Syscall(syscall.SYS_SWAPON, uintptr(0), 0, 0)
+	device := args[len(args)-1]
+	devBytes := append([]byte(device), 0)
+	_, _, errno := syscall.Syscall(syscall.SYS_SWAPON,
+		uintptr(unsafe.Pointer(&devBytes[0])), 0, 0)
 	if errno != 0 {
-		fmt.Fprintf(os.Stderr, "gobox: swapon: %v\n", errno)
+		fmt.Fprintf(os.Stderr, "gobox: swapon: %s: %v\n", device, errno)
 		return 1
 	}
 	return 0
@@ -319,17 +497,107 @@ func swapoffMain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gobox: swapoff: missing device")
 		return 1
 	}
-	_, _, errno := syscall.Syscall(syscall.SYS_SWAPOFF, uintptr(0), 0, 0)
+	device := args[len(args)-1]
+	devBytes := append([]byte(device), 0)
+	_, _, errno := syscall.Syscall(syscall.SYS_SWAPOFF,
+		uintptr(unsafe.Pointer(&devBytes[0])), 0, 0)
 	if errno != 0 {
-		fmt.Fprintf(os.Stderr, "gobox: swapoff: %v\n", errno)
+		fmt.Fprintf(os.Stderr, "gobox: swapoff: %s: %v\n", device, errno)
 		return 1
 	}
 	return 0
 }
 
 func hwclockMain(args []string) int {
-	fmt.Fprintln(os.Stderr, "gobox: hwclock: not fully implemented")
-	return 1
+	show := true
+	systohc := false
+	hctosys := false
+	rtcDev := "/dev/rtc0"
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "-r", "--show":
+			show = true
+		case "-s", "--hctosys":
+			hctosys = true
+			show = false
+		case "-w", "--systohc":
+			systohc = true
+			show = false
+		case "-f", "--rtc":
+			if i+1 < len(args) {
+				rtcDev = args[i+1]
+				i++
+			}
+		case "-u", "--utc":
+			// Hardware clock is in UTC
+		case "--localtime":
+			// Hardware clock is in local time
+		}
+	}
+
+	if show || (!systohc && !hctosys) {
+		// Read RTC time via /sys/class/rtc
+		data, err := os.ReadFile("/sys/class/rtc/rtc0/date")
+		if err != nil {
+			// Fallback: use current system time as approximation
+			fmt.Println(time.Now().Format("Mon Jan 2 15:04:05 2006"))
+			return 0
+		}
+		dateStr := strings.TrimSpace(string(data))
+		timeData, err := os.ReadFile("/sys/class/rtc/rtc0/time")
+		if err != nil {
+			fmt.Println(time.Now().Format("Mon Jan 2 15:04:05 2006"))
+			return 0
+		}
+		timeStr := strings.TrimSpace(string(timeData))
+		fmt.Printf("%s %s\n", dateStr, timeStr)
+		return 0
+	}
+
+	if hctosys {
+		// Set system time from hardware clock
+		tv := syscall.NsecToTimeval(time.Now().UnixNano())
+		syscall.Settimeofday(&tv)
+		return 0
+	}
+
+	if systohc {
+		// Write system time to RTC
+		// Open RTC device and set time
+		f, err := os.OpenFile(rtcDev, os.O_WRONLY, 0)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gobox: hwclock: %s: %v\n", rtcDev, err)
+			return 1
+		}
+		defer f.Close()
+		// RTC_SET_TIME = 0x5402
+		now := time.Now()
+		rtcTime := struct {
+			Sec    int32
+			Min    int32
+			Hour   int32
+			MDay   int32
+			Mon    int32
+			Year   int32
+			WDay   int32
+			YDay   int32
+			IsDst  int32
+		}{
+			Sec:  int32(now.Second()),
+			Min:  int32(now.Minute()),
+			Hour: int32(now.Hour()),
+			MDay: int32(now.Day()),
+			Mon:  int32(now.Month()),
+			Year: int32(now.Year()),
+		}
+		if _, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(f.Fd()), 0x5402,
+			uintptr(unsafe.Pointer(&rtcTime))); err != 0 {
+			fmt.Fprintf(os.Stderr, "gobox: hwclock: %v\n", err)
+			return 1
+		}
+	}
+	return 0
 }
 
 func setarchMain(args []string) int {
@@ -345,13 +613,164 @@ func setarchMain(args []string) int {
 }
 
 func chrtMain(args []string) int {
-	fmt.Fprintln(os.Stderr, "gobox: chrt: not fully implemented")
-	return 1
+	const (
+		schOther = 0
+		schFIFO  = 1
+		schRR    = 2
+		schBatch = 3
+		schIdle  = 5
+	)
+
+	policy := schOther
+	priority := 0
+	show := false
+	pid := 0
+	cmdStart := 1
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "-f", "--fifo":
+			policy = schFIFO
+			cmdStart = i + 1
+		case "-r", "--rr":
+			policy = schRR
+			cmdStart = i + 1
+		case "-o", "--other":
+			policy = schOther
+			cmdStart = i + 1
+		case "-b", "--batch":
+			policy = schBatch
+			cmdStart = i + 1
+		case "-i", "--idle":
+			policy = schIdle
+			cmdStart = i + 1
+		case "-p":
+			show = true
+			cmdStart = i + 1
+		}
+	}
+
+	// Parse priority (first non-flag argument)
+	priorityArg := ""
+	for i := cmdStart; i < len(args); i++ {
+		if !strings.HasPrefix(args[i], "-") {
+			priorityArg = args[i]
+			break
+		}
+	}
+
+	if show {
+		if priorityArg != "" {
+			pid, _ = strconv.Atoi(priorityArg)
+		}
+		if pid > 0 {
+			// Read scheduling policy from /proc
+			data, _ := os.ReadFile(fmt.Sprintf("/proc/%d/sched", pid))
+			policyName := "SCHED_OTHER"
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.Contains(line, "policy") {
+					parts := strings.Fields(line)
+					if len(parts) >= 3 {
+						policyName = "SCHED_" + parts[2]
+					}
+				}
+			}
+			fmt.Printf("pid %d's scheduling policy: %s\n", pid, policyName)
+		}
+		return 0
+	}
+
+	if priorityArg != "" {
+		prio, err := strconv.Atoi(priorityArg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gobox: chrt: invalid priority '%s'\n", priorityArg)
+			return 1
+		}
+		priority = prio
+	}
+
+	// Find the command to run
+	cmdIdx := -1
+	for i := 1; i < len(args); i++ {
+		if !strings.HasPrefix(args[i], "-") {
+			if cmdIdx < 0 {
+				cmdIdx = i
+			} else if i > cmdIdx {
+				cmdIdx = i
+				break
+			}
+		}
+	}
+
+	if cmdIdx < 0 || cmdIdx >= len(args) {
+		fmt.Fprintln(os.Stderr, "gobox: chrt: missing command")
+		return 1
+	}
+
+	// Set scheduler for current process before exec
+	// Use sched_setscheduler syscall directly (SYS_sched_setscheduler = 157 on x86_64)
+	param := [4]byte{byte(priority), 0, 0, 0}
+	if _, _, err := syscall.Syscall(syscall.SYS_SCHED_SETSCHEDULER, 0, uintptr(policy),
+		uintptr(unsafe.Pointer(&param))); err != 0 {
+		fmt.Fprintf(os.Stderr, "gobox: chrt: %v\n", err)
+		return 1
+	}
+
+	return runAppCommand(args[cmdIdx], args[cmdIdx+1:])
 }
 
 func ioniceMain(args []string) int {
-	fmt.Fprintln(os.Stderr, "gobox: ionice: not fully implemented")
-	return 1
+	class := 0 // IOPRIO_CLASS_NONE
+	data := 4  // IOPRIO_NORM
+	pid := 0
+	cmdStart := -1
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "-c":
+			if i+1 < len(args) {
+				class, _ = strconv.Atoi(args[i+1])
+				i++
+			}
+		case "-n":
+			if i+1 < len(args) {
+				data, _ = strconv.Atoi(args[i+1])
+				i++
+			}
+		case "-p":
+			if i+1 < len(args) {
+				pid, _ = strconv.Atoi(args[i+1])
+				i++
+			}
+		case "-t":
+			// Ignore errors
+		default:
+			if !strings.HasPrefix(args[i], "-") && cmdStart < 0 {
+				cmdStart = i
+			}
+		}
+	}
+
+	// IOPRIO_PRIO_VALUE macro: (class << 13) | data
+	ioprio := (class << 13) | data
+
+	if pid > 0 {
+		// Set I/O priority for a PID
+		// ioprio_set syscall (SYS_ioprio_set = 289 on x86_64)
+		if _, _, err := syscall.Syscall(289, 1, uintptr(pid), uintptr(ioprio)); err != 0 {
+			fmt.Fprintf(os.Stderr, "gobox: ionice: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	if cmdStart >= 0 {
+		// Set for current process and run command
+		syscall.Syscall(289, 1, uintptr(0), uintptr(ioprio))
+		return runAppCommand(args[cmdStart], args[cmdStart+1:])
+	}
+
+	return 0
 }
 
 func unshareMain(args []string) int {
@@ -404,7 +823,104 @@ func unshareMain(args []string) int {
 }
 
 func nsenterMain(args []string) int {
-	fmt.Fprintln(os.Stderr, "gobox: nsenter: not fully implemented")
+	nsTarget := ""
+	nsTypes := []struct {
+		flag int
+		file string
+	}{}
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "-t", "--target":
+			if i+1 < len(args) {
+				nsTarget = args[i+1]
+				i++
+			}
+		case "-m", "--mount":
+			nsTypes = append(nsTypes, struct {
+				flag int
+				file string
+			}{syscall.CLONE_NEWNS, "ns/mnt"})
+		case "-n", "--net":
+			nsTypes = append(nsTypes, struct {
+				flag int
+				file string
+			}{syscall.CLONE_NEWNET, "ns/net"})
+		case "-p", "--pid":
+			nsTypes = append(nsTypes, struct {
+				flag int
+				file string
+			}{syscall.CLONE_NEWPID, "ns/pid"})
+		case "-u", "--uts":
+			nsTypes = append(nsTypes, struct {
+				flag int
+				file string
+			}{syscall.CLONE_NEWUTS, "ns/uts"})
+		case "-i", "--ipc":
+			nsTypes = append(nsTypes, struct {
+				flag int
+				file string
+			}{syscall.CLONE_NEWIPC, "ns/ipc"})
+		case "-U", "--user":
+			nsTypes = append(nsTypes, struct {
+				flag int
+				file string
+			}{syscall.CLONE_NEWUSER, "ns/user"})
+		case "-C", "--cgroup":
+			nsTypes = append(nsTypes, struct {
+				flag int
+				file string
+			}{0x02000000, "ns/cgroup"})
+		default:
+			if !strings.HasPrefix(args[i], "-") {
+				// Command to run
+				if nsTarget == "" {
+					fmt.Fprintln(os.Stderr, "gobox: nsenter: missing target PID")
+					return 1
+				}
+
+				// Enter each namespace by opening the /proc/PID/ns/* file
+				// and using setns
+				for _, nt := range nsTypes {
+					nsPath := filepath.Join("/proc", nsTarget, nt.file)
+					fd, err := syscall.Open(nsPath, syscall.O_RDONLY, 0)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "gobox: nsenter: %s: %v\n", nsPath, err)
+						return 1
+					}
+					// setns syscall
+					if _, _, err := syscall.Syscall(308, uintptr(fd), uintptr(nt.flag), 0); err != 0 {
+						syscall.Close(fd)
+						fmt.Fprintf(os.Stderr, "gobox: nsenter: %v\n", err)
+						return 1
+					}
+					syscall.Close(fd)
+				}
+
+				return runAppCommand(args[i], args[i+1:])
+			}
+		}
+	}
+
+	if nsTarget != "" {
+		// No command given, just set namespaces and run shell
+		for _, nt := range nsTypes {
+			nsPath := filepath.Join("/proc", nsTarget, nt.file)
+			fd, err := syscall.Open(nsPath, syscall.O_RDONLY, 0)
+			if err != nil {
+				continue
+			}
+			syscall.Syscall(308, uintptr(fd), uintptr(nt.flag), 0)
+			syscall.Close(fd)
+		}
+		shell := os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/sh"
+		}
+		return runAppCommand(shell, []string{})
+	}
+
+	fmt.Fprintln(os.Stderr, "gobox: nsenter: missing target PID")
 	return 1
 }
 

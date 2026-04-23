@@ -4,7 +4,12 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -19,8 +24,51 @@ func init() {
 }
 
 func syslogdMain(args []string) int {
-	fmt.Println("gobox: syslogd: starting (logging to /var/log/messages)")
 	logFile := "/var/log/messages"
+	small := false
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "-R":
+			if i+1 < len(args) {
+				i++ // remote host
+			}
+		case "-L":
+			small = true
+		case "-s":
+			if i+1 < len(args) {
+				i++ // size
+			}
+		case "-b":
+			if i+1 < len(args) {
+				i++ // buffer size
+			}
+		case "-O":
+			if i+1 < len(args) {
+				logFile = args[i+1]
+				i++
+			}
+		case "-S":
+			small = true
+		}
+	}
+
+	// Remove existing socket
+	os.Remove("/dev/log")
+
+	// Create Unix domain socket
+	addr, err := net.ResolveUnixAddr("unixgram", "/dev/log")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: syslogd: %v\n", err)
+		return 1
+	}
+	conn, err := net.ListenUnixgram("unixgram", addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: syslogd: %v\n", err)
+		return 1
+	}
+	defer conn.Close()
+	os.Chmod("/dev/log", 0666)
 
 	f, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
@@ -29,10 +77,27 @@ func syslogdMain(args []string) int {
 	}
 	defer f.Close()
 
-	// Read from /dev/log (Unix domain socket)
-	_ = f
+	fmt.Fprintf(os.Stderr, "gobox: syslogd: started, logging to %s\n", logFile)
+
+	buf := make([]byte, 4096)
 	for {
-		time.Sleep(time.Second)
+		n, err := conn.Read(buf)
+		if err != nil {
+			time.Sleep(time.Second)
+			continue
+		}
+		msg := strings.TrimRight(string(buf[:n]), "\x00\n\r")
+		if msg == "" {
+			continue
+		}
+		timestamp := time.Now().Format("Jan  2 15:04:05")
+		logLine := fmt.Sprintf("%s %s\n", timestamp, msg)
+		f.WriteString(logLine)
+		f.Sync()
+
+		if !small {
+			os.Stderr.WriteString(logLine)
+		}
 	}
 }
 
@@ -66,10 +131,124 @@ func logreadMain(args []string) int {
 }
 
 func crondMain(args []string) int {
-	fmt.Println("gobox: crond: starting")
-	_ = time.Second
-	_ = bufio.ScanLines
-	return 0
+	cronDir := "/etc/crontabs"
+	foreground := true
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "-d":
+			if i+1 < len(args) {
+				i++ // debug level
+			}
+		case "-l":
+			if i+1 < len(args) {
+				i++ // log level
+			}
+		case "-c":
+			if i+1 < len(args) {
+				cronDir = args[i+1]
+				i++
+			}
+		case "-b":
+			foreground = false
+		case "-f":
+			foreground = true
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "gobox: crond: starting, cron dir: %s\n", cronDir)
+
+	if !foreground {
+		// Background mode: fork
+		return 0
+	}
+
+	// Main loop
+	for {
+		now := time.Now()
+		min := now.Minute()
+		hour := now.Hour()
+		day := now.Day()
+		mon := int(now.Month())
+		week := int(now.Weekday())
+
+		// Check crontabs
+		entries, err := os.ReadDir(cronDir)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				cronFile := filepath.Join(cronDir, entry.Name())
+				data, err := os.ReadFile(cronFile)
+				if err != nil {
+					continue
+				}
+				for _, line := range strings.Split(string(data), "\n") {
+					line = strings.TrimSpace(line)
+					if line == "" || strings.HasPrefix(line, "#") {
+						continue
+					}
+					// Parse: min hour day mon week command
+					fields := strings.Fields(line)
+					if len(fields) < 6 {
+						continue
+					}
+					cronMin := fields[0]
+					cronHour := fields[1]
+					cronDay := fields[2]
+					cronMon := fields[3]
+					cronWeek := fields[4]
+					cmd := strings.Join(fields[5:], " ")
+
+					if matchCron(cronMin, min) && matchCron(cronHour, hour) &&
+						matchCron(cronDay, day) && matchCron(cronMon, mon) &&
+						matchCron(cronWeek, week) {
+						fmt.Fprintf(os.Stderr, "gobox: crond: running: %s\n", cmd)
+						go func(cmdStr string) {
+							parts := strings.Fields(cmdStr)
+							if len(parts) > 0 {
+								exec.Command(parts[0], parts[1:]...).Start()
+							}
+						}(cmd)
+					}
+				}
+			}
+		}
+
+		// Sleep until next minute
+		next := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute()+1, 0, 0, now.Location())
+		time.Sleep(time.Until(next))
+	}
+}
+
+func matchCron(pattern string, value int) bool {
+	if pattern == "*" {
+		return true
+	}
+	// Handle comma-separated lists
+	for _, part := range strings.Split(pattern, ",") {
+		part = strings.TrimSpace(part)
+		if strings.Contains(part, "*/") {
+			step := 0
+			fmt.Sscanf(part, "*/%d", &step)
+			if step > 0 && value%step == 0 {
+				return true
+			}
+		} else if strings.Contains(part, "-") {
+			var start, end int
+			fmt.Sscanf(part, "%d-%d", &start, &end)
+			if value >= start && value <= end {
+				return true
+			}
+		} else {
+			n, _ := strconv.Atoi(part)
+			if n == value {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func crontabMain(args []string) int {

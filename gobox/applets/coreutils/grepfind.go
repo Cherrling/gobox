@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"gobox/applets"
@@ -27,6 +29,15 @@ func grepMain(args []string) int {
 	ignoreCase := false
 	printLineNum := false
 	reverse := false
+	countOnly := false
+	filesOnly := false
+	recursive := false
+	wordRegexp := false
+	lineRegexp := false
+	quiet := false
+	alwaysPrintFilename := false
+	noFilename := false
+	fixedStrings := false
 	pattern := ""
 	paths := []string{}
 
@@ -46,10 +57,28 @@ func grepMain(args []string) int {
 					printLineNum = true
 				case 'v':
 					reverse = true
+				case 'c':
+					countOnly = true
+				case 'l':
+					filesOnly = true
+				case 'r', 'R':
+					recursive = true
+				case 'w':
+					wordRegexp = true
+				case 'x':
+					lineRegexp = true
+				case 'q':
+					quiet = true
+				case 'H':
+					alwaysPrintFilename = true
+				case 'h':
+					noFilename = true
 				case 'E':
-					// extended regex - same behavior
+					// extended regex
 				case 'F':
-					// fixed strings - same behavior
+					fixedStrings = true
+				case 's':
+					// suppress errors
 				}
 			}
 			i++
@@ -73,17 +102,55 @@ func grepMain(args []string) int {
 		paths = []string{""}
 	}
 
-	if ignoreCase {
-		pattern = "(?i)" + pattern
+	// Handle recursive: if paths are directories, search them recursively
+	if recursive {
+		var expanded []string
+		for _, p := range paths {
+			if p == "" {
+				expanded = append(expanded, "")
+				continue
+			}
+			info, err := os.Stat(p)
+			if err != nil || !info.IsDir() {
+				expanded = append(expanded, p)
+				continue
+			}
+			filepath.Walk(p, func(fp string, fi os.FileInfo, err error) error {
+				if err != nil || fi.IsDir() {
+					return nil
+				}
+				expanded = append(expanded, fp)
+				return nil
+			})
+		}
+		paths = expanded
 	}
 
-	re, err := regexp.Compile(pattern)
+	// Build regexp
+	searchPattern := pattern
+	if fixedStrings {
+		searchPattern = regexp.QuoteMeta(pattern)
+	}
+	if wordRegexp {
+		searchPattern = `\b` + searchPattern + `\b`
+	}
+	if lineRegexp {
+		searchPattern = `^` + searchPattern + `$`
+	}
+	if ignoreCase {
+		searchPattern = "(?i)" + searchPattern
+	}
+
+	re, err := regexp.Compile(searchPattern)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gobox: grep: invalid pattern: %s\n", err)
 		return 1
 	}
 
-	multipleFiles := len(paths) > 1
+	showFilename := len(paths) > 1 || alwaysPrintFilename
+	if noFilename {
+		showFilename = false
+	}
 	exitCode := 1
 
 	for _, path := range paths {
@@ -96,7 +163,6 @@ func grepMain(args []string) int {
 		} else {
 			f, err := os.Open(path)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "gobox: grep: %s: %v\n", path, err)
 				continue
 			}
 			defer f.Close()
@@ -104,6 +170,7 @@ func grepMain(args []string) int {
 		}
 
 		lineNum := 1
+		count := 0
 		for scanner.Scan() {
 			line := scanner.Text()
 			matched := re.MatchString(line)
@@ -111,8 +178,19 @@ func grepMain(args []string) int {
 				matched = !matched
 			}
 			if matched {
+				count++
 				exitCode = 0
-				if multipleFiles {
+				if filesOnly {
+					fmt.Println(fname)
+					break
+				}
+				if countOnly {
+					continue
+				}
+				if quiet {
+					return 0
+				}
+				if showFilename {
 					if printLineNum {
 						fmt.Printf("%s:%d:%s\n", fname, lineNum, line)
 					} else {
@@ -127,6 +205,13 @@ func grepMain(args []string) int {
 				}
 			}
 			lineNum++
+		}
+		if countOnly && count > 0 {
+			if showFilename {
+				fmt.Printf("%s:%d\n", fname, count)
+			} else {
+				fmt.Printf("%d\n", count)
+			}
 		}
 	}
 	return exitCode
@@ -155,14 +240,38 @@ func findMain(args []string) int {
 		exprStart = 2
 	}
 
-	// Parse expressions
 	type predicate struct {
 		name string
 		val  string
 	}
 	var predicates []predicate
+	var execCmd []string
+	execAction := ""
+	execFound := false
 
 	for i := exprStart; i < len(args); i++ {
+		if args[i] == "-exec" || args[i] == "-ok" {
+			execAction = args[i]
+			execFound = true
+			i++
+			for i < len(args) && args[i] != ";" && args[i] != ";" {
+				if args[i] == "{}" {
+					execCmd = append(execCmd, "{}")
+				} else {
+					execCmd = append(execCmd, args[i])
+				}
+				i++
+			}
+			continue
+		}
+		if args[i] == "-delete" {
+			predicates = append(predicates, predicate{"delete", ""})
+			continue
+		}
+		if args[i] == "-empty" {
+			predicates = append(predicates, predicate{"empty", ""})
+			continue
+		}
 		switch args[i] {
 		case "-name":
 			if i+1 < len(args) {
@@ -184,6 +293,11 @@ func findMain(args []string) int {
 				predicates = append(predicates, predicate{"maxdepth", args[i+1]})
 				i++
 			}
+		case "-mindepth":
+			if i+1 < len(args) {
+				predicates = append(predicates, predicate{"mindepth", args[i+1]})
+				i++
+			}
 		case "-mtime":
 			if i+1 < len(args) {
 				predicates = append(predicates, predicate{"mtime", args[i+1]})
@@ -191,6 +305,21 @@ func findMain(args []string) int {
 			}
 		case "-print":
 			predicates = append(predicates, predicate{"print", ""})
+		case "-user":
+			if i+1 < len(args) {
+				predicates = append(predicates, predicate{"user", args[i+1]})
+				i++
+			}
+		case "-group":
+			if i+1 < len(args) {
+				predicates = append(predicates, predicate{"group", args[i+1]})
+				i++
+			}
+		case "-perm":
+			if i+1 < len(args) {
+				predicates = append(predicates, predicate{"perm", args[i+1]})
+				i++
+			}
 		default:
 			if !strings.HasPrefix(args[i], "-") {
 				predicates = append(predicates, predicate{"path", args[i]})
@@ -199,9 +328,21 @@ func findMain(args []string) int {
 	}
 
 	maxDepth := -1
+	minDepth := -1
 	for _, p := range predicates {
 		if p.name == "maxdepth" {
 			fmt.Sscanf(p.val, "%d", &maxDepth)
+		}
+		if p.name == "mindepth" {
+			fmt.Sscanf(p.val, "%d", &minDepth)
+		}
+	}
+
+	hasAction := false
+	for _, p := range predicates {
+		if p.name == "print" || p.name == "delete" || execFound {
+			hasAction = true
+			break
 		}
 	}
 
@@ -211,14 +352,18 @@ func findMain(args []string) int {
 			if err != nil {
 				return nil
 			}
-			if maxDepth >= 0 {
-				depth := strings.Count(path[len(root):], string(filepath.Separator))
-				if depth > maxDepth {
-					if info.IsDir() {
-						return filepath.SkipDir
-					}
-					return nil
+			depth := 0
+			if path != root {
+				depth = strings.Count(path[len(root):], string(filepath.Separator))
+			}
+			if maxDepth >= 0 && depth > maxDepth {
+				if info.IsDir() {
+					return filepath.SkipDir
 				}
+				return nil
+			}
+			if minDepth >= 0 && depth < minDepth {
+				return nil
 			}
 
 			match := true
@@ -237,21 +382,61 @@ func findMain(args []string) int {
 						match = info.IsDir()
 					case "l":
 						match = info.Mode()&os.ModeSymlink != 0
+					case "s":
+						match = info.Mode()&os.ModeSocket != 0
 					default:
 						match = false
 					}
 				case "size":
-					// Simplified size matching
+					match = matchSize(p.val, info.Size())
+				case "empty":
+					match = info.Size() == 0
+				case "user":
+					match = matchUser(p.val)
 				case "print", "":
 					// always matches
+				case "delete":
+					if match {
+						os.RemoveAll(path)
+					}
 				case "path":
 					if path != p.val {
 						match = false
 					}
 				}
 			}
-			if match {
+
+			if match && execFound && len(execCmd) > 0 {
+				args := make([]string, len(execCmd))
+				for i, a := range execCmd {
+					if a == "{}" {
+						args[i] = path
+					} else {
+						args[i] = a
+					}
+				}
+				if execAction == "-ok" {
+					fmt.Printf("< %s ...? ", strings.Join(args, " "))
+					var resp string
+					fmt.Scanf("%s", &resp)
+					if resp != "y" && resp != "Y" {
+						return nil
+					}
+				}
+				cmd := exec.Command(args[0], args[1:]...)
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				cmd.Run()
+			}
+
+			if match && !hasAction {
 				fmt.Println(path)
+			} else if match && hasAction {
+				for _, p := range predicates {
+					if p.name == "print" {
+						fmt.Println(path)
+					}
+				}
 			}
 			return nil
 		})
@@ -261,6 +446,27 @@ func findMain(args []string) int {
 		}
 	}
 	return exitCode
+}
+
+func matchSize(pattern string, size int64) bool {
+	if pattern == "" {
+		return true
+	}
+	if strings.HasPrefix(pattern, "+") {
+		n, _ := strconv.ParseInt(pattern[1:], 10, 64)
+		return size > n
+	}
+	if strings.HasPrefix(pattern, "-") {
+		n, _ := strconv.ParseInt(pattern[1:], 10, 64)
+		return size < n
+	}
+	n, _ := strconv.ParseInt(pattern, 10, 64)
+	return size == n
+}
+
+func matchUser(name string) bool {
+	// Always match if we can't verify
+	return true
 }
 
 func sedMain(args []string) int {

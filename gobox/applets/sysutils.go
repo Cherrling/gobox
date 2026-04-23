@@ -21,6 +21,13 @@ func init() {
 	Register("crontab", AppletFunc(crontabMain))
 	Register("watchdog", AppletFunc(watchdogMain))
 	Register("rdate", AppletFunc(rdateMain))
+	Register("acpid", AppletFunc(acpidMain))
+	Register("adjtimex", AppletFunc(adjtimexMain))
+	Register("sysctl", AppletFunc(sysctlMain))
+	Register("fsfreeze", AppletFunc(fsfreezeMain))
+	Register("fstrim", AppletFunc(fstrimMain))
+	Register("fsync", AppletFunc(fsyncMain))
+	Register("blkdiscard", AppletFunc(blkdiscardMain))
 }
 
 func syslogdMain(args []string) int {
@@ -307,3 +314,56 @@ func rdateMain(args []string) int {
 }
 
 var _ = io.Discard
+
+// acpidMain - ACPI daemon
+func acpidMain(args []string) int {
+	return execTool("acpid", args[1:])
+}
+
+// adjtimexMain - adjust kernel time variables
+func adjtimexMain(args []string) int {
+	return execTool("adjtimex", args[1:])
+}
+
+// sysctlMain - configure kernel parameters
+func sysctlMain(args []string) int {
+	return execTool("sysctl", args[1:])
+}
+
+// fsfreezeMain - suspend/resume access to a filesystem
+func fsfreezeMain(args []string) int {
+	return execTool("fsfreeze", args[1:])
+}
+
+// fstrimMain - discard unused blocks on a filesystem
+func fstrimMain(args []string) int {
+	return execTool("fstrim", args[1:])
+}
+
+// fsyncMain - synchronize a file's data to disk
+func fsyncMain(args []string) int {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "gobox: fsync: missing file")
+		return 1
+	}
+	exitCode := 0
+	for _, path := range args[1:] {
+		f, err := os.Open(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gobox: fsync: %s: %v\n", path, err)
+			exitCode = 1
+			continue
+		}
+		if err := f.Sync(); err != nil {
+			fmt.Fprintf(os.Stderr, "gobox: fsync: %s: %v\n", path, err)
+			exitCode = 1
+		}
+		f.Close()
+	}
+	return exitCode
+}
+
+// blkdiscardMain - discard sectors on a device
+func blkdiscardMain(args []string) int {
+	return execTool("blkdiscard", args[1:])
+}

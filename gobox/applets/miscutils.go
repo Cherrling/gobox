@@ -36,6 +36,17 @@ func init() {
 	Register("setsid", AppletFunc(setsidMain))
 	Register("flock", AppletFunc(flockMain))
 	Register("rev", AppletFunc(revMain))
+	Register("id", AppletFunc(idMain))
+	Register("groups", AppletFunc(groupsMain))
+	Register("last", AppletFunc(lastMain))
+	Register("whois", AppletFunc(whoisMain))
+	Register("w", AppletFunc(wMain))
+	Register("wall", AppletFunc(wallMain))
+	Register("lsof", AppletFunc(lsofMain))
+	Register("tree", AppletFunc(treeMain))
+	Register("bc", AppletFunc(bcMain))
+	Register("dc", AppletFunc(dcMain))
+	Register("man", AppletFunc(manMain))
 }
 
 func haltMain(args []string) int {
@@ -597,3 +608,219 @@ func runCommandExit(cmd *exec.Cmd) int {
 
 // Dummy to satisfy sort import (used by netstat)
 var _ = sort.Strings
+
+// idMain - print user identity
+func idMain(args []string) int {
+	uid := os.Getuid()
+	gid := os.Getgid()
+	username := lookupUserName(uid)
+	groupName := lookupGroupName(gid)
+
+	fmt.Printf("uid=%d(%s) gid=%d(%s)", uid, username, gid, groupName)
+
+	// Get supplementary groups
+	data, err := os.ReadFile("/proc/self/status")
+	if err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "Groups:") {
+				groups := strings.Fields(line[7:])
+				if len(groups) > 0 {
+					fmt.Print(" groups=")
+					for i, g := range groups {
+						gidNum, _ := strconv.Atoi(g)
+						gName := lookupGroupName(gidNum)
+						if i > 0 {
+							fmt.Print(",")
+						}
+						fmt.Printf("%d(%s)", gidNum, gName)
+					}
+				}
+			}
+		}
+	}
+	fmt.Println()
+	return 0
+}
+
+// groupsMain - print group memberships
+func groupsMain(args []string) int {
+	return execTool("groups", args[1:])
+}
+
+// lastMain - show last logged in users
+func lastMain(args []string) int {
+	data, err := os.ReadFile("/var/log/wtmp")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gobox: last: no wtmp file")
+		return 1
+	}
+
+	type utmp struct {
+		Type    int16
+		_       [2]byte
+		User    [32]byte
+		ID      [4]byte
+		Line    [32]byte
+		Host    [256]byte
+		_       [16]byte
+		Session int32
+		Sec     int32
+		Usec    int32
+		IP      [4]int32
+		_       [20]byte
+	}
+
+	entrySize := 384
+	for i := 0; i+entrySize <= len(data); i += entrySize {
+		var u utmp
+		// Manually decode
+		user := strings.TrimRight(string(u.User[:]), "\x00")
+		line := strings.TrimRight(string(u.Line[:]), "\x00")
+		host := strings.TrimRight(string(u.Host[:]), "\x00")
+		_ = user
+		_ = line
+		_ = host
+	}
+
+	fmt.Fprintln(os.Stderr, "gobox: last: wtmp parsing limited")
+	return 1
+}
+
+// whoisMain - whois client
+func whoisMain(args []string) int {
+	return execTool("whois", args[1:])
+}
+
+// wMain - show who is logged on
+func wMain(args []string) int {
+	return execTool("w", args[1:])
+}
+
+// wallMain - send message to all users
+func wallMain(args []string) int {
+	msg := ""
+	if len(args) > 1 {
+		msg = strings.Join(args[1:], " ")
+	} else {
+		data, _ := io.ReadAll(os.Stdin)
+		msg = strings.TrimSpace(string(data))
+	}
+
+	if msg == "" {
+		fmt.Fprintln(os.Stderr, "gobox: wall: no message")
+		return 1
+	}
+
+	// Write to all terminals
+	for _, tty := range []string{"/dev/pts"} {
+		entries, err := os.ReadDir(tty)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			path := tty + "/" + entry.Name()
+			f, err := os.OpenFile(path, os.O_WRONLY, 0)
+			if err != nil {
+				continue
+			}
+			host, _ := os.Hostname()
+			fmt.Fprintf(f, "\rBroadcast message from %s@%s (pts/%s):\r\n", os.Getenv("USER"), host, entry.Name())
+			fmt.Fprintf(f, "\r%s\r\n", msg)
+			f.Close()
+		}
+	}
+	return 0
+}
+
+// lsofMain - list open files
+func lsofMain(args []string) int {
+	return execTool("lsof", args[1:])
+}
+
+// treeMain - list directory tree
+func treeMain(args []string) int {
+	root := "."
+	if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
+		root = args[1]
+	}
+
+	var printTree func(dir string, prefix string) int
+	printTree = func(dir string, prefix string) int {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return 0
+		}
+		count := 0
+		for i, entry := range entries {
+			isLast := i == len(entries)-1
+			connector := "├── "
+			if isLast {
+				connector = "└── "
+			}
+			fmt.Printf("%s%s%s\n", prefix, connector, entry.Name())
+			count++
+			if entry.IsDir() {
+				subPrefix := prefix + "│   "
+				if isLast {
+					subPrefix = prefix + "    "
+				}
+				count += printTree(filepath.Join(dir, entry.Name()), subPrefix)
+			}
+		}
+		return count
+	}
+
+	fmt.Println(root)
+	total := printTree(root, "")
+	fmt.Printf("\n%d directories, %d files\n", 0, total)
+	return 0
+}
+
+// bcMain - arbitrary precision calculator
+func bcMain(args []string) int {
+	return execTool("bc", args[1:])
+}
+
+// dcMain - stack-based calculator
+func dcMain(args []string) int {
+	return execTool("dc", args[1:])
+}
+
+// manMain - manual pager
+func manMain(args []string) int {
+	return execTool("man", args[1:])
+}
+
+func lookupUserName(uid int) string {
+	data, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		return fmt.Sprintf("uid=%d", uid)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 3 {
+			uidStr := fields[2]
+			if u, err := strconv.Atoi(uidStr); err == nil && u == uid {
+				return fields[0]
+			}
+		}
+	}
+	return fmt.Sprintf("%d", uid)
+}
+
+func lookupGroupName(gid int) string {
+	data, err := os.ReadFile("/etc/group")
+	if err != nil {
+		return fmt.Sprintf("gid=%d", gid)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 3 {
+			gidStr := fields[2]
+			if g, err := strconv.Atoi(gidStr); err == nil && g == gid {
+				return fields[0]
+			}
+		}
+	}
+	return fmt.Sprintf("%d", gid)
+}

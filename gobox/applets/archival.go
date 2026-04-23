@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 func init() {
@@ -16,6 +18,23 @@ func init() {
 	Register("gzip", AppletFunc(gzipMain))
 	Register("gunzip", AppletFunc(gunzipMain))
 	Register("zcat", AppletFunc(zcatMain))
+	Register("bunzip2", AppletFunc(bunzip2Main))
+	Register("bzcat", AppletFunc(bzcatMain))
+	Register("bzip2", AppletFunc(bzip2Main))
+	Register("unlzma", AppletFunc(unlzmaMain))
+	Register("lzcat", AppletFunc(lzcatMain))
+	Register("lzma", AppletFunc(lzmaMain))
+	Register("unxz", AppletFunc(unxzMain))
+	Register("xzcat", AppletFunc(xzcatMain))
+	Register("xz", AppletFunc(xzMain))
+	Register("uncompress", AppletFunc(uncompressMain))
+	Register("cpio", AppletFunc(cpioMain))
+	Register("ar", AppletFunc(arMain))
+	Register("unzip", AppletFunc(unzipMain))
+	Register("lzop", AppletFunc(lzopMain))
+	Register("unlzop", AppletFunc(unlzopMain))
+	Register("lzopcat", AppletFunc(lzopcatMain))
+	Register("rpm2cpio", AppletFunc(rpm2cpioMain))
 }
 
 func tarMain(args []string) int {
@@ -346,6 +365,108 @@ func zcatMain(args []string) int {
 		io.Copy(os.Stdout, gr)
 		gr.Close()
 		f.Close()
+	}
+	return 0
+}
+
+// bunzip2Main - decompress .bz2 files
+func bunzip2Main(args []string) int {
+	return execTool("bunzip2", args[1:])
+}
+
+// bzcatMain - decompress .bz2 to stdout
+func bzcatMain(args []string) int {
+	return execTool("bzcat", args[1:])
+}
+
+// bzip2Main - compress files with bzip2
+func bzip2Main(args []string) int {
+	return execTool("bzip2", args[1:])
+}
+
+// unlzmaMain - decompress .lzma files
+func unlzmaMain(args []string) int {
+	return execTool("unlzma", args[1:])
+}
+
+// lzcatMain - decompress .lzma to stdout
+func lzcatMain(args []string) int {
+	return execTool("lzcat", args[1:])
+}
+
+// lzmaMain - compress with lzma
+func lzmaMain(args []string) int {
+	return execTool("lzma", args[1:])
+}
+
+// unxzMain - decompress .xz files
+func unxzMain(args []string) int {
+	return execTool("unxz", args[1:])
+}
+
+// xzcatMain - decompress .xz to stdout
+func xzcatMain(args []string) int {
+	return execTool("xzcat", args[1:])
+}
+
+// xzMain - compress with xz
+func xzMain(args []string) int {
+	return execTool("xz", args[1:])
+}
+
+// uncompressMain - decompress .Z files
+func uncompressMain(args []string) int {
+	return execTool("uncompress", args[1:])
+}
+
+// cpioMain - copy files in/out of cpio archives
+func cpioMain(args []string) int {
+	return execTool("cpio", args[1:])
+}
+
+// arMain - create/extract ar archives
+func arMain(args []string) int {
+	return execTool("ar", args[1:])
+}
+
+// unzipMain - list/test/extract zip archives
+func unzipMain(args []string) int {
+	return execTool("unzip", args[1:])
+}
+
+// lzopMain - compress with lzop
+func lzopMain(args []string) int {
+	return execTool("lzop", args[1:])
+}
+
+// unlzopMain - decompress .lzo files
+func unlzopMain(args []string) int {
+	return execTool("unlzop", args[1:])
+}
+
+// lzopcatMain - decompress .lzo to stdout
+func lzopcatMain(args []string) int {
+	return execTool("lzopcat", args[1:])
+}
+
+// rpm2cpioMain - extract cpio archive from RPM
+func rpm2cpioMain(args []string) int {
+	return execTool("rpm2cpio", args[1:])
+}
+
+// execTool runs an external tool with args, passing stdin/stdout/stderr
+func execTool(tool string, args []string) int {
+	cmd := exec.Command(tool, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+				return status.ExitStatus()
+			}
+		}
+		return 1
 	}
 	return 0
 }

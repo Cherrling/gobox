@@ -31,6 +31,12 @@ func init() {
 	Register("ionice", AppletFunc(ioniceMain))
 	Register("unshare", AppletFunc(unshareMain))
 	Register("nsenter", AppletFunc(nsenterMain))
+	Register("fallocate", AppletFunc(fallocateMain))
+	Register("mountpoint", AppletFunc(mountpointMain))
+	Register("taskset", AppletFunc(tasksetMain))
+	Register("setpriv", AppletFunc(setprivMain))
+	Register("switch_root", AppletFunc(switchRootMain))
+	Register("pivot_root", AppletFunc(pivotRootMain))
 }
 
 func mountMain(args []string) int {
@@ -939,4 +945,68 @@ func runAppCommand(cmd string, args []string) int {
 		return 1
 	}
 	return state.ExitCode()
+}
+
+// fallocateMain - preallocate space to a file
+func fallocateMain(args []string) int {
+	return execTool("fallocate", args[1:])
+}
+
+// mountpointMain - check if a directory is a mountpoint
+func mountpointMain(args []string) int {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "gobox: mountpoint: missing operand")
+		return 1
+	}
+	path := args[1]
+	var st1, st2 syscall.Stat_t
+	if err := syscall.Stat(path, &st1); err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: mountpoint: %s: %v\n", path, err)
+		return 1
+	}
+	if err := syscall.Stat(path+"/..", &st2); err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: mountpoint: %s: %v\n", path, err)
+		return 1
+	}
+	if st1.Dev != st2.Dev || st1.Ino == st2.Ino {
+		fmt.Printf("%s is a mountpoint\n", path)
+		return 0
+	}
+	fmt.Printf("%s is not a mountpoint\n", path)
+	return 1
+}
+
+// tasksetMain - set or retrieve a process's CPU affinity
+func tasksetMain(args []string) int {
+	return execTool("taskset", args[1:])
+}
+
+// setprivMain - set privilege for a command
+func setprivMain(args []string) int {
+	return execTool("setpriv", args[1:])
+}
+
+// switchRootMain - switch to another filesystem as the root
+func switchRootMain(args []string) int {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "gobox: switch_root: missing operand")
+		return 1
+	}
+	return execTool("switch_root", args[1:])
+}
+
+// pivotRootMain - change the root filesystem
+func pivotRootMain(args []string) int {
+	if len(args) < 3 {
+		fmt.Fprintln(os.Stderr, "gobox: pivot_root: missing operand")
+		return 1
+	}
+	newRoot := args[1]
+	putOld := args[2]
+	err := syscall.PivotRoot(newRoot, putOld)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: pivot_root: %v\n", err)
+		return 1
+	}
+	return 0
 }

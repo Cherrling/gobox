@@ -23,6 +23,23 @@ func init() {
 	Register("route", AppletFunc(routeMain))
 	Register("nslookup", AppletFunc(nslookupMain))
 	Register("telnet", AppletFunc(telnetMain))
+	Register("arping", AppletFunc(arpingMain))
+	Register("ftpd", AppletFunc(ftpdMain))
+	Register("ftpget", AppletFunc(ftpgetMain))
+	Register("ftpput", AppletFunc(ftpputMain))
+	Register("httpd", AppletFunc(httpdMain))
+	Register("ifenslave", AppletFunc(ifenslaveMain))
+	Register("inetd", AppletFunc(inetdMain))
+	Register("netcat", AppletFunc(netcatMain))
+	Register("telnetd", AppletFunc(telnetdMain))
+	Register("tftp", AppletFunc(tftpMain))
+	Register("tftpd", AppletFunc(tftpdMain))
+	Register("udhcpd", AppletFunc(udhcpdMain))
+	Register("udpsvd", AppletFunc(udpsvdMain))
+	Register("zcip", AppletFunc(zcipMain))
+	Register("ifplugd", AppletFunc(ifplugdMain))
+	Register("dnsd", AppletFunc(dnsdMain))
+	Register("dhcprelay", AppletFunc(dhcprelayMain))
 }
 
 func pingMain(args []string) int {
@@ -414,4 +431,89 @@ func telnetMain(args []string) int {
 	}()
 	<-done
 	return 0
+}
+
+// arpingMain - send ARP requests
+func arpingMain(args []string) int {
+	return execTool("arping", args[1:])
+}
+
+// ftpdMain - FTP server
+func ftpdMain(args []string) int {
+	return execTool("ftpd", args[1:])
+}
+
+// ftpgetMain - FTP download
+func ftpgetMain(args []string) int {
+	return execTool("ftpget", args[1:])
+}
+
+// ftpputMain - FTP upload
+func ftpputMain(args []string) int {
+	return execTool("ftpput", args[1:])
+}
+
+// httpdMain - HTTP server
+func httpdMain(args []string) int {
+	return execTool("httpd", args[1:])
+}
+
+// ifenslaveMain - configure network interfaces for bonding
+func ifenslaveMain(args []string) int {
+	return execTool("ifenslave", args[1:])
+}
+
+// inetdMain - internet super-server
+func inetdMain(args []string) int {
+	return execTool("inetd", args[1:])
+}
+
+// netcatMain - networking tool (alias for nc)
+func netcatMain(args []string) int {
+	return ncMain(args)
+}
+
+// telnetdMain - telnet server
+func telnetdMain(args []string) int {
+	return execTool("telnetd", args[1:])
+}
+
+// tftpMain - TFTP client
+func tftpMain(args []string) int {
+	return execTool("tftp", args[1:])
+}
+
+// tftpdMain - TFTP server
+func tftpdMain(args []string) int {
+	return execTool("tftpd", args[1:])
+}
+
+// udhcpdMain - DHCP server
+func udhcpdMain(args []string) int {
+	return execTool("udhcpd", args[1:])
+}
+
+// udpsvdMain - UDP server
+func udpsvdMain(args []string) int {
+	return execTool("udpsvd", args[1:])
+}
+
+// zcipMain - ZeroConf IPv4 link-local
+func zcipMain(args []string) int {
+	return execTool("zcip", args[1:])
+}
+
+// ifplugdMain - network interface plug detection daemon
+func ifplugdMain(args []string) int {
+	return execTool("ifplugd", args[1:])
+}
+
+// dnsdMain - DNS server
+func dnsdMain(args []string) int {
+	return execTool("dnsd", args[1:])
+}
+
+// dhcprelayMain - DHCP relay agent
+func dhcprelayMain(args []string) int {
+	return execTool("dhcprelay", args[1:])
 }

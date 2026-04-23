@@ -4,7 +4,7 @@ import (
 	"os"
 
 	"gobox/applets"
-	// Import applet packages to register them
+	_ "gobox/applets/coreutils"
 )
 
 func main() {

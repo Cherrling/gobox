@@ -20,6 +20,13 @@ type UsageDesc interface {
 	Usage() string
 }
 
+// AppletFunc adapts a function to the Applet interface.
+type AppletFunc func(args []string) int
+
+func (f AppletFunc) Run(args []string) int {
+	return f(args)
+}
+
 var registry = map[string]Applet{}
 
 // Register adds an applet to the registry under the given name.

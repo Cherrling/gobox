@@ -100,18 +100,82 @@ func tarCreate(tarFile string, paths []string, compress bool) int {
 	tw := tar.NewWriter(&buf)
 
 	for _, path := range paths {
+		// Sanitize path: strip /../ components
+		cleanPath := path
+		sawDotDot := false
+		for strings.Contains(cleanPath, "/../") || strings.HasPrefix(cleanPath, "../") {
+			sawDotDot = true
+			if strings.HasPrefix(cleanPath, "../") {
+				cleanPath = cleanPath[3:]
+			} else {
+				idx := strings.Index(cleanPath, "/../")
+				if idx >= 0 {
+					// Remove the component before /../
+					prevSlash := strings.LastIndex(cleanPath[:idx], "/")
+					if prevSlash >= 0 {
+						cleanPath = cleanPath[:prevSlash] + cleanPath[idx+3:]
+					} else {
+						cleanPath = cleanPath[idx+4:]
+					}
+				}
+			}
+		}
+		if sawDotDot {
+			fmt.Fprintf(os.Stderr, "tar: removing leading '%s' from member names\n", strings.Replace(path, cleanPath, "..", 1))
+			// Actually, we need to extract the stripped prefix
+			// The prefix is everything that was removed
+			prefix := path
+			if strings.HasPrefix(path, "./") {
+				prefix = prefix[2:]
+			}
+			if strings.HasSuffix(cleanPath, "/") {
+				cleanPath = cleanPath[:len(cleanPath)-1]
+			}
+			// Find the actual prefix that was removed
+			if idx := strings.LastIndex(path, cleanPath); idx > 0 {
+				prefix = path[:idx]
+			} else {
+				prefix = path
+			}
+			// Remove leading/trailing slashes for the warning
+			prefix = strings.Trim(prefix, "/")
+			if prefix != "" {
+				fmt.Fprintf(os.Stderr, "tar: removing leading '%s/' from member names\n", prefix)
+			}
+		}
+		path = cleanPath
+
 		err := filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
 
-			header, err := tar.FileInfoHeader(info, "")
-			if err != nil {
-				return err
-			}
-			header.Name = filePath
+			// Sanitize relative path
+			relPath := filePath
+			relPath = strings.TrimPrefix(relPath, "./")
 
-			if info.IsDir() {
+			var linkTarget string
+			var header *tar.Header
+
+			if info.Mode()&os.ModeSymlink != 0 {
+				linkTarget, err = os.Readlink(filePath)
+				if err != nil {
+					return err
+				}
+				header, err = tar.FileInfoHeader(info, linkTarget)
+				if err != nil {
+					return err
+				}
+			} else {
+				header, err = tar.FileInfoHeader(info, "")
+				if err != nil {
+					return err
+				}
+			}
+
+			header.Name = relPath
+
+			if info.IsDir() && !strings.HasSuffix(header.Name, "/") {
 				header.Name += "/"
 			}
 
@@ -119,7 +183,7 @@ func tarCreate(tarFile string, paths []string, compress bool) int {
 				return err
 			}
 
-			if !info.IsDir() {
+			if info.Mode().IsRegular() {
 				f, err := os.Open(filePath)
 				if err != nil {
 					return err
@@ -136,15 +200,6 @@ func tarCreate(tarFile string, paths []string, compress bool) int {
 	}
 	tw.Close()
 
-	out := io.Writer(os.Stdout)
-	if compress {
-		gw := gzip.NewWriter(out.(io.WriteCloser))
-		gw.Write(buf.Bytes())
-		gw.Close()
-	} else {
-		os.Stdout.Write(buf.Bytes())
-	}
-
 	if tarFile != "" {
 		mode := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 		f, err := os.OpenFile(tarFile, mode, 0644)
@@ -154,6 +209,15 @@ func tarCreate(tarFile string, paths []string, compress bool) int {
 		}
 		defer f.Close()
 		f.Write(buf.Bytes())
+	} else {
+		out := io.Writer(os.Stdout)
+		if compress {
+			gw := gzip.NewWriter(out.(io.WriteCloser))
+			gw.Write(buf.Bytes())
+			gw.Close()
+		} else {
+			os.Stdout.Write(buf.Bytes())
+		}
 	}
 
 	return 0
@@ -185,16 +249,36 @@ func tarExtract(tarFile string, dir string, compress bool) int {
 	}
 
 	tr := tar.NewReader(r)
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
+
+	// Check for empty input (not a tarball)
+	header, err := tr.Next()
+	if err == io.EOF {
+		// Check if there's any data at all
+		buf := make([]byte, 1)
+		var n int
+		if tarFile != "" {
+			f, _ := os.Open(tarFile)
+			if f != nil {
+				n, _ = f.Read(buf)
+				f.Close()
+			}
+		} else {
+			// Can't easily peek at stdin, assume empty
+			return 0
 		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+		if n == 0 {
+			fmt.Fprintln(os.Stderr, "tar: short read")
 			return 1
 		}
+		return 0
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+		return 1
+	}
 
+	// Process the first header and continue with remaining
+	for {
 		target := header.Name
 		if dir != "" {
 			target = filepath.Join(dir, target)
@@ -203,6 +287,7 @@ func tarExtract(tarFile string, dir string, compress bool) int {
 		switch header.Typeflag {
 		case tar.TypeDir:
 			os.MkdirAll(target, os.FileMode(header.Mode))
+			os.Chmod(target, os.FileMode(header.Mode))
 		case tar.TypeReg:
 			os.MkdirAll(filepath.Dir(target), 0755)
 			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
@@ -212,6 +297,33 @@ func tarExtract(tarFile string, dir string, compress bool) int {
 			}
 			io.Copy(f, tr)
 			f.Close()
+			os.Chmod(target, os.FileMode(header.Mode))
+		case tar.TypeSymlink:
+			os.MkdirAll(filepath.Dir(target), 0755)
+			os.Remove(target)
+			if err := os.Symlink(header.Linkname, target); err != nil {
+				fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+				return 1
+			}
+		case tar.TypeLink:
+			linkTarget := header.Linkname
+			if dir != "" {
+				linkTarget = filepath.Join(dir, linkTarget)
+			}
+			os.MkdirAll(filepath.Dir(target), 0755)
+			if err := os.Link(linkTarget, target); err != nil {
+				fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+				return 1
+			}
+		}
+
+		header, err = tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+			return 1
 		}
 	}
 	return 0
@@ -243,15 +355,47 @@ func tarList(tarFile string, compress bool) int {
 	}
 
 	tr := tar.NewReader(r)
+
+	// Check for empty input
+	header, err := tr.Next()
+	if err == io.EOF {
+		buf := make([]byte, 1)
+		var n int
+		if tarFile != "" {
+			f, _ := os.Open(tarFile)
+			if f != nil {
+				n, _ = f.Read(buf)
+				f.Close()
+			}
+		}
+		if n == 0 {
+			fmt.Fprintln(os.Stderr, "tar: short read")
+			return 1
+		}
+		return 0
+	}
+	if err != nil {
+		return 1
+	}
+
 	for {
-		header, err := tr.Next()
+		name := header.Name
+		switch header.Typeflag {
+		case tar.TypeSymlink:
+			fmt.Printf("%s -> %s\n", name, header.Linkname)
+		case tar.TypeLink:
+			fmt.Printf("%s -> %s\n", name, header.Linkname)
+		default:
+			fmt.Println(name)
+		}
+
+		header, err = tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return 1
 		}
-		fmt.Println(header.Name)
 	}
 	return 0
 }

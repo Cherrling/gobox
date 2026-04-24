@@ -67,6 +67,9 @@ func catMain(args []string) int {
 				squeezeBlank = true
 			case 'v':
 				showNonprint = true
+			case 'e':
+				showNonprint = true
+				showEnds = true
 			}
 		}
 	}
@@ -150,30 +153,49 @@ func catMain(args []string) int {
 }
 
 func cpMain(args []string) int {
-	if len(args) < 3 {
-		fmt.Fprintln(os.Stderr, "gobox: cp: missing operand")
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "cp: missing operand")
 		return 1
 	}
 
 	recursive := false
+	noDeref := false    // -d or -P: preserve symlinks
+	deref := false      // -L: always dereference
+	cmdLineDeref := false // -H: dereference cmdline only
 	srcArgs := args[1:]
 
-	// Parse options
-	for len(srcArgs) > 0 && strings.HasPrefix(srcArgs[0], "-") {
+	// Character-level flag parsing for combined flags (e.g. -Rd, -RL, -RHP)
+	for len(srcArgs) > 0 && len(srcArgs[0]) > 0 && srcArgs[0][0] == '-' {
 		opt := srcArgs[0]
-		if opt == "-r" || opt == "-R" || opt == "--recursive" {
-			recursive = true
-		} else if opt == "-a" {
-			recursive = true
-		} else {
-			fmt.Fprintf(os.Stderr, "gobox: cp: unknown option: %s\n", opt)
-			return 1
+		if opt == "--" {
+			srcArgs = srcArgs[1:]
+			break
+		}
+		for _, c := range opt[1:] {
+			switch c {
+			case 'r', 'R':
+				recursive = true
+			case 'd':
+				noDeref = true
+			case 'P':
+				noDeref = true
+			case 'L':
+				deref = true
+			case 'H':
+				cmdLineDeref = true
+			case 'a':
+				recursive = true
+				noDeref = true
+			default:
+				fmt.Fprintf(os.Stderr, "cp: unknown option: -%c\n", c)
+				return 1
+			}
 		}
 		srcArgs = srcArgs[1:]
 	}
 
 	if len(srcArgs) < 2 {
-		fmt.Fprintln(os.Stderr, "gobox: cp: missing operand")
+		fmt.Fprintln(os.Stderr, "cp: missing operand")
 		return 1
 	}
 
@@ -183,16 +205,47 @@ func cpMain(args []string) int {
 	destInfo, destErr := os.Stat(dest)
 	isDir := destErr == nil && destInfo.IsDir()
 
+	// Determine cmdline symlink behavior:
+	//   -L: always follow
+	//   -H: follow cmdline symlinks
+	//   -P/-d: never follow
+	//   default non-recursive: follow cmdline symlinks
+	//   default recursive: don't follow
+	followCmdline := deref || cmdLineDeref
+	if !recursive && !noDeref && !deref && !cmdLineDeref {
+		followCmdline = true // default non-recursive
+	}
+
+	// Determine recursive copy behavior (inside directories)
+	derefInside := deref // -L: dereference inside dirs; otherwise preserve
+
+	exitCode := 0
 	for _, src := range sources {
-		srcInfo, err := os.Stat(src)
+		srcLInfo, err := os.Lstat(src)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gobox: cp: %s: %v\n", src, err)
-			return 1
+			fmt.Fprintf(os.Stderr, "cp: %s: %v\n", src, err)
+			exitCode = 1
+			continue
 		}
 
-		if srcInfo.IsDir() {
+		isSymlink := srcLInfo.Mode()&os.ModeSymlink != 0
+
+		var realInfo os.FileInfo
+		if isSymlink && followCmdline {
+			realInfo, err = os.Stat(src)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cp: %s: %v\n", src, err)
+				exitCode = 1
+				continue
+			}
+		} else {
+			realInfo = srcLInfo
+		}
+
+		if realInfo.IsDir() {
 			if !recursive {
-				fmt.Fprintf(os.Stderr, "gobox: cp: -r not specified; omitting directory '%s'\n", src)
+				fmt.Fprintf(os.Stderr, "cp: omitting directory '%s'\n", src)
+				exitCode = 1
 				continue
 			}
 			var target string
@@ -201,27 +254,42 @@ func cpMain(args []string) int {
 			} else {
 				target = dest
 			}
-			if err := copyDir(src, target); err != nil {
-				fmt.Fprintf(os.Stderr, "gobox: cp: %v\n", err)
+			if err := copyDir(src, target, derefInside); err != nil {
+				fmt.Fprintf(os.Stderr, "cp: %v\n", err)
+				exitCode = 1
+			}
+		} else if isSymlink && !followCmdline {
+			// Preserve symlink (not followed)
+			var target string
+			if isDir {
+				target = filepath.Join(dest, filepath.Base(src))
+			} else if len(sources) > 1 {
+				fmt.Fprintf(os.Stderr, "cp: target '%s' is not a directory\n", dest)
 				return 1
+			} else {
+				target = dest
+			}
+			if err := copySymlink(src, target); err != nil {
+				fmt.Fprintf(os.Stderr, "cp: %v\n", err)
+				exitCode = 1
 			}
 		} else {
 			var target string
 			if isDir {
 				target = filepath.Join(dest, filepath.Base(src))
 			} else if len(sources) > 1 {
-				fmt.Fprintf(os.Stderr, "gobox: cp: target '%s' is not a directory\n", dest)
+				fmt.Fprintf(os.Stderr, "cp: target '%s' is not a directory\n", dest)
 				return 1
 			} else {
 				target = dest
 			}
 			if err := copyFile(src, target); err != nil {
-				fmt.Fprintf(os.Stderr, "gobox: cp: %v\n", err)
-				return 1
+				fmt.Fprintf(os.Stderr, "cp: %v\n", err)
+				exitCode = 1
 			}
 		}
 	}
-	return 0
+	return exitCode
 }
 
 func copyFile(src, dst string) error {
@@ -241,7 +309,6 @@ func copyFile(src, dst string) error {
 		return fmt.Errorf("copy failed: %w", err)
 	}
 
-	// Preserve permissions
 	srcInfo, _ := os.Stat(src)
 	if srcInfo != nil {
 		os.Chmod(dst, srcInfo.Mode())
@@ -249,7 +316,18 @@ func copyFile(src, dst string) error {
 	return nil
 }
 
-func copyDir(src, dst string) error {
+func copySymlink(src, dst string) error {
+	target, err := os.Readlink(src)
+	if err != nil {
+		return fmt.Errorf("cannot readlink '%s': %w", src, err)
+	}
+	if err := os.Symlink(target, dst); err != nil {
+		return fmt.Errorf("cannot create symlink '%s': %w", dst, err)
+	}
+	return nil
+}
+
+func copyDir(src, dst string, deref bool) error {
 	if err := os.MkdirAll(dst, 0755); err != nil {
 		return fmt.Errorf("cannot create directory '%s': %w", dst, err)
 	}
@@ -263,8 +341,33 @@ func copyDir(src, dst string) error {
 		srcPath := filepath.Join(src, entry.Name())
 		dstPath := filepath.Join(dst, entry.Name())
 
-		if entry.IsDir() {
-			if err := copyDir(srcPath, dstPath); err != nil {
+		lInfo, err := os.Lstat(srcPath)
+		if err != nil {
+			return err
+		}
+
+		isSymlink := lInfo.Mode()&os.ModeSymlink != 0
+
+		if isSymlink && deref {
+			rInfo, err := os.Stat(srcPath)
+			if err != nil {
+				return err
+			}
+			if rInfo.IsDir() {
+				if err := copyDir(srcPath, dstPath, deref); err != nil {
+					return err
+				}
+			} else {
+				if err := copyFile(srcPath, dstPath); err != nil {
+					return err
+				}
+			}
+		} else if isSymlink {
+			if err := copySymlink(srcPath, dstPath); err != nil {
+				return err
+			}
+		} else if lInfo.IsDir() {
+			if err := copyDir(srcPath, dstPath, deref); err != nil {
 				return err
 			}
 		} else {
@@ -307,7 +410,7 @@ func mvMain(args []string) int {
 				return 1
 			}
 			if srcInfo.IsDir() {
-				if err := copyDir(src, target); err != nil {
+				if err := copyDir(src, target, false); err != nil {
 					fmt.Fprintf(os.Stderr, "gobox: mv: %v\n", err)
 					return 1
 				}
@@ -937,26 +1040,114 @@ func realpathMain(args []string) int {
 		fmt.Fprintln(os.Stderr, "gobox: realpath: missing operand")
 		return 1
 	}
-	path, err := filepath.EvalSymlinks(args[1])
+	path := args[1]
+	resolved, err := realpathResolve(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gobox: realpath: %s: %v\n", args[1], err)
+		fmt.Fprintf(os.Stderr, "realpath: %s: %v\n", path, err)
 		return 1
 	}
-	fmt.Println(path)
+	fmt.Println(resolved)
 	return 0
 }
 
+func realpathResolve(path string) (string, error) {
+	// Clean the path first
+	cleaned := filepath.Clean(path)
+	if !filepath.IsAbs(cleaned) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		cleaned = filepath.Join(cwd, cleaned)
+	}
+
+	// Try EvalSymlinks first - works for existing paths
+	resolved, err := filepath.EvalSymlinks(cleaned)
+	if err == nil {
+		return resolved, nil
+	}
+
+	// Path doesn't exist. Walk from root to resolve what we can.
+	parts := strings.Split(cleaned, string(filepath.Separator))
+	var prefix string
+	if parts[0] == "" {
+		prefix = "/"
+		parts = parts[1:]
+	}
+
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		candidate := filepath.Join(prefix, part)
+		info, err := os.Lstat(candidate)
+		if err != nil {
+			// Component doesn't exist
+			if i == len(parts)-1 {
+				// Last component - return what we have so far + remaining
+				remaining := filepath.Join(parts[i:]...)
+				return filepath.Join(prefix, remaining), nil
+			}
+			// Intermediate component missing - error
+			return "", fmt.Errorf("No such file or directory")
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(candidate)
+			if err != nil {
+				return "", err
+			}
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(prefix, target)
+			}
+			rest := filepath.Join(parts[i+1:]...)
+			fullTarget := filepath.Join(target, rest)
+			return realpathResolve(fullTarget)
+		}
+		prefix = candidate
+	}
+
+	return prefix, nil
+}
+
 func readlinkMain(args []string) int {
-	if len(args) < 2 {
+	canonicalize := false
+	paths := args[1:]
+
+	for len(paths) > 0 && paths[0][0] == '-' {
+		opt := paths[0]
+		if opt == "-f" {
+			canonicalize = true
+			paths = paths[1:]
+		} else {
+			// unknown option, treat as path
+			break
+		}
+	}
+
+	if len(paths) < 1 {
 		fmt.Fprintln(os.Stderr, "gobox: readlink: missing operand")
 		return 1
 	}
-	path, err := os.Readlink(args[1])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "gobox: readlink: %s: %v\n", args[1], err)
-		return 1
+
+	path := paths[0]
+	if canonicalize {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return 0
+		}
+		absPath, err := filepath.Abs(resolved)
+		if err != nil {
+			return 0
+		}
+		fmt.Println(absPath)
+		return 0
 	}
-	fmt.Println(path)
+
+	target, err := os.Readlink(path)
+	if err != nil {
+		return 0
+	}
+	fmt.Println(target)
 	return 0
 }
 

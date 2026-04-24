@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"encoding/base32"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"io"
 	"math/rand"
 	"os"
@@ -195,6 +197,30 @@ func translateDateFormat(f string) string {
 	return r.Replace(f)
 }
 
+// parseDdSize parses dd size values with optional k/M/G suffixes
+func parseDdSize(s string) int {
+	if len(s) == 0 {
+		return 0
+	}
+	mult := 1
+	switch s[len(s)-1] {
+	case 'k', 'K':
+		mult = 1024
+		s = s[:len(s)-1]
+	case 'M':
+		mult = 1024 * 1024
+		s = s[:len(s)-1]
+	case 'G':
+		mult = 1024 * 1024 * 1024
+		s = s[:len(s)-1]
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n * mult
+}
+
 func ddMain(args []string) int {
 	ifSize := 512
 	ofSize := 512
@@ -229,13 +255,16 @@ func ddMain(args []string) int {
 			}
 			os.Stdout = f
 		case "bs":
-			n, _ := strconv.Atoi(val)
+			n := parseDdSize(val)
 			if n > 0 {
 				ifSize = n
 				ofSize = n
 			}
 		case "count":
-			count, _ = strconv.Atoi(val)
+			n := parseDdSize(val)
+			if n >= 0 {
+				count = n
+			}
 		case "skip":
 			skip, _ = strconv.Atoi(val)
 		case "seek":
@@ -243,12 +272,12 @@ func ddMain(args []string) int {
 		case "conv":
 			conv = val
 		case "ibs":
-			n, _ := strconv.Atoi(val)
+			n := parseDdSize(val)
 			if n > 0 {
 				ifSize = n
 			}
 		case "obs":
-			n, _ := strconv.Atoi(val)
+			n := parseDdSize(val)
 			if n > 0 {
 				ofSize = n
 			}
@@ -651,45 +680,180 @@ func primeFactors(n uint64) []uint64 {
 }
 
 func seqMain(args []string) int {
-	var start, end, step float64 = 1, 1, 1
-	switch len(args) {
+	sep := "\n"
+	padWidth := 0
+
+	// Parse flags
+	positional := []string{}
+	for _, arg := range args[1:] {
+		switch arg {
+		case "-w":
+			padWidth = -1 // will be determined from values
+		default:
+			positional = append(positional, arg)
+		}
+	}
+
+	// Handle -s separator
+	for i := 0; i < len(positional); i++ {
+		if positional[i] == "-s" && i+1 < len(positional) {
+			sep = positional[i+1]
+			positional = append(positional[:i], positional[i+2:]...)
+			break
+		}
+	}
+
+	var startStr, stepStr, endStr string
+	switch len(positional) {
+	case 1:
+		endStr = positional[0]
 	case 2:
-		end, _ = strconv.ParseFloat(args[1], 64)
+		startStr = positional[0]
+		endStr = positional[1]
 	case 3:
-		start, _ = strconv.ParseFloat(args[1], 64)
-		end, _ = strconv.ParseFloat(args[2], 64)
-	case 4:
-		start, _ = strconv.ParseFloat(args[1], 64)
-		step, _ = strconv.ParseFloat(args[2], 64)
-		end, _ = strconv.ParseFloat(args[3], 64)
+		startStr = positional[0]
+		stepStr = positional[1]
+		endStr = positional[2]
 	default:
 		fmt.Fprintln(os.Stderr, "gobox: seq: missing operand")
 		return 1
 	}
 
-	if step == 0 {
-		fmt.Fprintln(os.Stderr, "gobox: seq: zero step")
-		return 1
+	// Determine precision from input strings
+	// Step precision takes priority, then max of start/end
+	prec := 0
+	if stepStr != "" {
+		prec = decimalPlaces(stepStr)
+	} else {
+		if startStr != "" {
+			if p := decimalPlaces(startStr); p > prec {
+				prec = p
+			}
+		}
+		if p := decimalPlaces(endStr); p > prec {
+			prec = p
+		}
 	}
 
+	// Parse numbers
+	var start, end, step float64 = 1, 1, 1
+	if startStr != "" {
+		start, _ = strconv.ParseFloat(startStr, 64)
+	}
+	if endStr != "" {
+		end, _ = strconv.ParseFloat(endStr, 64)
+	}
+	if stepStr != "" {
+		step, _ = strconv.ParseFloat(stepStr, 64)
+	} else if startStr != "" && endStr != "" {
+		step = 1
+	}
+
+	// Handle zero step: infinite output
+	if step == 0 {
+		for {
+			_, err := fmt.Print(formatFloatSeq(start, prec, padWidth))
+			if err != nil {
+				break
+			}
+			_, err = fmt.Print(sep)
+			if err != nil {
+				break
+			}
+		}
+		return 0
+	}
+
+	// Determine padding width
+	if padWidth == -1 {
+		padWidth = formatWidth(startStr, stepStr, endStr, prec)
+	}
+
+	// Generate sequence
+	first := true
 	if step > 0 {
-		for i := start; i <= end; i += step {
-			fmt.Println(formatFloat(i))
+		for i := start; i <= end+step/1e12; i += step {
+			if !first {
+				fmt.Print(sep)
+			}
+			first = false
+			fmt.Print(formatFloatSeq(i, prec, padWidth))
 		}
 	} else {
-		for i := start; i >= end; i += step {
-			fmt.Println(formatFloat(i))
+		for i := start; i >= end+step/1e12; i += step {
+			if !first {
+				fmt.Print(sep)
+			}
+			first = false
+			fmt.Print(formatFloatSeq(i, prec, padWidth))
 		}
+	}
+	if !first {
+		fmt.Println()
 	}
 	return 0
 }
 
-func formatFloat(f float64) string {
-	s := strconv.FormatFloat(f, 'f', -1, 64)
-	// Remove trailing zeros
-	if strings.Contains(s, ".") {
-		s = strings.TrimRight(s, "0")
-		s = strings.TrimRight(s, ".")
+func decimalPlaces(s string) int {
+	if dot := strings.Index(s, "."); dot >= 0 {
+		return len(s) - dot - 1
+	}
+	return 0
+}
+
+func formatWidth(startStr, stepStr, endStr string, prec int) int {
+	maxLen := 0
+	for _, s := range []string{startStr, stepStr, endStr} {
+		if s == "" {
+			continue
+		}
+		clean := s
+		if clean[0] == '-' || clean[0] == '+' {
+			clean = clean[1:]
+		}
+		// Get integer part width (before decimal point)
+		intPart := clean
+		if dot := strings.Index(clean, "."); dot >= 0 {
+			intPart = clean[:dot]
+		}
+		if len(intPart) > maxLen {
+			maxLen = len(intPart)
+		}
+	}
+	// Total width = integer part + decimal point + decimal places
+	if prec > 0 {
+		return maxLen + 1 + prec
+	}
+	return maxLen
+}
+
+func formatFloatSeq(f float64, prec int, width int) string {
+	if prec > 0 {
+		s := strconv.FormatFloat(f, 'f', prec, 64)
+		if width > 0 {
+			sign := ""
+			if s[0] == '-' {
+				sign = "-"
+				s = s[1:]
+			}
+			for len(s) < width {
+				s = "0" + s
+			}
+			s = sign + s
+		}
+		return s
+	}
+	s := strconv.FormatFloat(f, 'f', 0, 64)
+	if width > 0 {
+		sign := ""
+		if s[0] == '-' {
+			sign = "-"
+			s = s[1:]
+		}
+		for len(s) < width {
+			s = "0" + s
+		}
+		s = sign + s
 	}
 	return s
 }
@@ -837,7 +1001,7 @@ func tsortMain(args []string) int {
 
 	var data []byte
 	var err error
-	if paths[0] == "" {
+	if paths[0] == "" || paths[0] == "-" {
 		data, err = io.ReadAll(os.Stdin)
 	} else {
 		data, err = os.ReadFile(paths[0])
@@ -849,19 +1013,32 @@ func tsortMain(args []string) int {
 
 	fields := strings.Fields(string(data))
 	if len(fields)%2 != 0 {
-		// Remove last element if odd
-		fields = fields[:len(fields)-1]
+		fmt.Fprintf(os.Stderr, "gobox: tsort: odd number of fields\n")
+		return 1
 	}
 
 	// Build graph
 	graph := map[string][]string{}
 	inDegree := map[string]int{}
+	allNodes := map[string]bool{}
 	for i := 0; i < len(fields); i += 2 {
 		from, to := fields[i], fields[i+1]
+		allNodes[from] = true
+		allNodes[to] = true
+		if from == to {
+			// Self-loop: ignore
+			continue
+		}
 		graph[from] = append(graph[from], to)
 		inDegree[to]++
 		if _, ok := inDegree[from]; !ok {
 			inDegree[from] = 0
+		}
+	}
+	// Add nodes that only appear as self-loops
+	for node := range allNodes {
+		if _, ok := inDegree[node]; !ok {
+			inDegree[node] = 0
 		}
 	}
 
@@ -874,10 +1051,12 @@ func tsortMain(args []string) int {
 	}
 	sort.Strings(queue)
 
+	processed := 0
 	for len(queue) > 0 {
 		node := queue[0]
 		queue = queue[1:]
 		fmt.Println(node)
+		processed++
 		for _, neighbor := range graph[node] {
 			inDegree[neighbor]--
 			if inDegree[neighbor] == 0 {
@@ -885,6 +1064,11 @@ func tsortMain(args []string) int {
 				sort.Strings(queue)
 			}
 		}
+	}
+
+	if processed < len(inDegree) {
+		fmt.Fprintf(os.Stderr, "gobox: tsort: cycle detected\n")
+		return 1
 	}
 	return 0
 }
@@ -1196,207 +1380,513 @@ func testEval(args []string) int {
 	if len(args) == 0 {
 		return 1
 	}
-
-	if len(args) == 1 {
-		if args[0] == "" {
-			return 1
-		}
-		return 0
+	result := evalOr(args, 0, len(args))
+	if result < 0 {
+		return 1
 	}
+	return 0
+}
 
-	if len(args) == 2 {
-		switch args[0] {
-		case "!":
-			if testEval(args[1:]) == 0 {
-				return 1
-			}
-			return 0
-		case "-n":
-			if args[1] != "" {
-				return 0
-			}
-			return 1
-		case "-z":
-			if args[1] == "" {
-				return 0
-			}
-			return 1
-		default:
-			if args[0] == args[1] {
-				return 0
-			}
-			return 1
-		}
-	}
-
-	if len(args) >= 3 {
-		switch args[1] {
-		case "=", "==":
-			if args[0] == args[2] {
-				return 0
-			}
-			return 1
-		case "!=":
-			if args[0] != args[2] {
-				return 0
-			}
-			return 1
-		case "-eq":
-			a, _ := strconv.Atoi(args[0])
-			b, _ := strconv.Atoi(args[2])
-			if a == b {
-				return 0
-			}
-			return 1
-		case "-ne":
-			a, _ := strconv.Atoi(args[0])
-			b, _ := strconv.Atoi(args[2])
-			if a != b {
-				return 0
-			}
-			return 1
-		case "-lt":
-			a, _ := strconv.Atoi(args[0])
-			b, _ := strconv.Atoi(args[2])
-			if a < b {
-				return 0
-			}
-			return 1
-		case "-le":
-			a, _ := strconv.Atoi(args[0])
-			b, _ := strconv.Atoi(args[2])
-			if a <= b {
-				return 0
-			}
-			return 1
-		case "-gt":
-			a, _ := strconv.Atoi(args[0])
-			b, _ := strconv.Atoi(args[2])
-			if a > b {
-				return 0
-			}
-			return 1
-		case "-ge":
-			a, _ := strconv.Atoi(args[0])
-			b, _ := strconv.Atoi(args[2])
-			if a >= b {
-				return 0
-			}
-			return 1
-		case "-f":
-			info, err := os.Stat(args[2])
-			if err == nil && !info.IsDir() {
-				return 0
-			}
-			return 1
-		case "-d":
-			info, err := os.Stat(args[2])
-			if err == nil && info.IsDir() {
-				return 0
-			}
-			return 1
-		case "-e":
-			if _, err := os.Stat(args[2]); err == nil {
-				return 0
-			}
-			return 1
-		case "-r":
-			f, err := os.OpenFile(args[2], os.O_RDONLY, 0)
-			if err == nil {
-				f.Close()
-				return 0
-			}
-			return 1
-		case "-w":
-			f, err := os.OpenFile(args[2], os.O_WRONLY, 0)
-			if err == nil {
-				f.Close()
-				return 0
-			}
-			return 1
-		case "-x":
-			info, err := os.Stat(args[2])
-			if err == nil && info.Mode()&0111 != 0 {
-				return 0
-			}
-			return 1
-		case "-s":
-			info, err := os.Stat(args[2])
-			if err == nil && info.Size() > 0 {
-				return 0
-			}
-			return 1
-		case "-L", "-h":
-			info, err := os.Lstat(args[2])
-			if err == nil && info.Mode()&os.ModeSymlink != 0 {
-				return 0
-			}
-			return 1
+// evalOr evaluates expression: conjunction ('-o' conjunction)*
+// Returns -1 for false, 1 for true (so we can distinguish from 0 = success)
+func evalOr(args []string, start, end int) int {
+	// Find -o at this level (not inside parentheses)
+	level := 0
+	for i := start; i < end; i++ {
+		switch args[i] {
+		case "(":
+			level++
+		case ")":
+			level--
 		case "-o":
-			// Shell option (simplified)
-			return 1
+			if level == 0 {
+				left := evalOr(args, start, i)
+				right := evalOr(args, i+1, end)
+				if left > 0 || right > 0 {
+					return 1
+				}
+				return -1
+			}
+		}
+	}
+	return evalAnd(args, start, end)
+}
+
+// evalAnd evaluates expression: primary ('-a' primary)*
+func evalAnd(args []string, start, end int) int {
+	level := 0
+	for i := start; i < end; i++ {
+		switch args[i] {
+		case "(":
+			level++
+		case ")":
+			level--
+		case "-a":
+			if level == 0 {
+				left := evalAnd(args, start, i)
+				right := evalAnd(args, i+1, end)
+				if left > 0 && right > 0 {
+					return 1
+				}
+				return -1
+			}
+		}
+	}
+	return evalPrimary(args, start, end)
+}
+
+// evalPrimary evaluates: '(' expr ')' | '!' primary | unary/binary test
+func evalPrimary(args []string, start, end int) int {
+	if start >= end {
+		return -1
+	}
+
+	// Handle parentheses
+	if args[start] == "(" {
+		// Find matching )
+		level := 1
+		i := start + 1
+		for i < end && level > 0 {
+			switch args[i] {
+			case "(":
+				level++
+			case ")":
+				level--
+			}
+			if level > 0 {
+				i++
+			}
+		}
+		if level == 0 && i > start+1 && i <= end {
+			return evalOr(args, start+1, i)
+		}
+		// Not a valid group, fall through to treat as literal
+	}
+
+	// Handle ! - only as negation when not followed by a binary operator
+	if end-start >= 2 && args[start] == "!" && !isBinaryOp(args[start+1]) {
+		result := evalPrimary(args, start+1, end)
+		if result > 0 {
+			return -1
+		}
+		return 1
+	}
+
+	// Binary operator: args[start] OP args[start+2] (3 args: a OP b)
+	if end-start >= 3 {
+		a, op, b := args[start], args[start+1], args[start+2]
+		switch op {
+		case "=", "==":
+			if a == b { return 1 }
+			return -1
+		case "!=":
+			if a != b { return 1 }
+			return -1
+		case "-eq":
+			ai, _ := strconv.Atoi(a)
+			bi, _ := strconv.Atoi(b)
+			if ai == bi { return 1 }
+			return -1
+		case "-ne":
+			ai, _ := strconv.Atoi(a)
+			bi, _ := strconv.Atoi(b)
+			if ai != bi { return 1 }
+			return -1
+		case "-lt":
+			ai, _ := strconv.Atoi(a)
+			bi, _ := strconv.Atoi(b)
+			if ai < bi { return 1 }
+			return -1
+		case "-le":
+			ai, _ := strconv.Atoi(a)
+			bi, _ := strconv.Atoi(b)
+			if ai <= bi { return 1 }
+			return -1
+		case "-gt":
+			ai, _ := strconv.Atoi(a)
+			bi, _ := strconv.Atoi(b)
+			if ai > bi { return 1 }
+			return -1
+		case "-ge":
+			ai, _ := strconv.Atoi(a)
+			bi, _ := strconv.Atoi(b)
+			if ai >= bi { return 1 }
+			return -1
+		case "-f":
+			info, err := os.Stat(b)
+			if err == nil && !info.IsDir() { return 1 }
+			return -1
+		case "-d":
+			info, err := os.Stat(b)
+			if err == nil && info.IsDir() { return 1 }
+			return -1
+		case "-e":
+			if _, err := os.Stat(b); err == nil { return 1 }
+			return -1
+		case "-r":
+			f, err := os.OpenFile(b, os.O_RDONLY, 0)
+			if err == nil { f.Close(); return 1 }
+			return -1
+		case "-w":
+			f, err := os.OpenFile(b, os.O_WRONLY, 0)
+			if err == nil { f.Close(); return 1 }
+			return -1
+		case "-x":
+			info, err := os.Stat(b)
+			if err == nil && info.Mode()&0111 != 0 { return 1 }
+			return -1
+		case "-s":
+			info, err := os.Stat(b)
+			if err == nil && info.Size() > 0 { return 1 }
+			return -1
+		case "-L", "-h":
+			info, err := os.Lstat(b)
+			if err == nil && info.Mode()&os.ModeSymlink != 0 { return 1 }
+			return -1
 		}
 	}
 
-	// Default: return true if string is non-empty
-	if len(args) >= 1 && args[0] != "" {
-		return 0
+	// Unary operators
+	if end-start >= 2 {
+		switch args[start] {
+		case "-n":
+			if args[start+1] != "" { return 1 }
+			return -1
+		case "-z":
+			if args[start+1] == "" { return 1 }
+			return -1
+		}
 	}
-	return 1
+
+	// Default: test if single string is non-empty
+	if end-start == 1 {
+		if args[start] != "" {
+			return 1
+		}
+		return -1
+	}
+
+	// For unrecognized binary with 3+ args, try the first non-operator interpretation
+	// e.g., "a -a !" -> a is truthy, ! is truthy, -a is AND
+	// This falls through to the default string check
+	if end-start >= 1 && args[start] != "" {
+		return 1
+	}
+	return -1
+	}
+
+func isBinaryOp(s string) bool {
+	switch s {
+	case "=", "==", "!=", "-eq", "-ne", "-lt", "-le", "-gt", "-ge":
+		return true
+	}
+	return false
 }
 
 func odMain(args []string) int {
-	paths := args[1:]
-	if len(paths) == 0 {
-		paths = []string{""}
+	args = args[1:]
+
+	// Determine output type from flags
+	typeFlag := byte(0)
+	flags := ""
+	files := []string{}
+
+	for _, a := range args {
+		if a == "--traditional" || a == "--" {
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			flags += a[1:]
+		} else {
+			files = append(files, a)
+		}
 	}
 
+	// Determine the type flag (last one wins for simple cases)
+	for i := len(flags) - 1; i >= 0; i-- {
+		c := flags[i]
+		if strings.ContainsRune("abcdfhox", rune(c)) ||
+			c == 'B' || c == 'D' || c == 'F' || c == 'H' ||
+			c == 'I' || c == 'L' || c == 'O' || c == 'X' ||
+			c == 'e' || c == 'i' || c == 'l' || c == 's' {
+			typeFlag = c
+			break
+		}
+	}
+
+	if len(files) == 0 {
+		files = []string{""}
+	}
+
+	// Gather all data
+	var allData []byte
 	exitCode := 0
-	for _, path := range paths {
+	for _, f := range files {
 		var data []byte
 		var err error
-		if path == "" {
+		if f == "" {
 			data, err = io.ReadAll(os.Stdin)
 		} else {
-			data, err = os.ReadFile(path)
+			data, err = os.ReadFile(f)
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gobox: od: %s: %v\n", path, err)
+			fmt.Fprintf(os.Stderr, "gobox: od: %s: %v\n", f, err)
 			exitCode = 1
 			continue
 		}
-
-		addrWidth := 7
-		if len(data) > 0xFFFFFFF {
-			addrWidth = 11
-		}
-
-		for i := 0; i < len(data); i += 16 {
-			fmt.Printf("%0*o", addrWidth, i)
-			for j := 0; j < 16; j++ {
-				if j%8 == 0 {
-					fmt.Print(" ")
-				}
-				if i+j < len(data) {
-					fmt.Printf(" %02x", data[i+j])
-				} else {
-					fmt.Print("   ")
-				}
-			}
-			fmt.Print("  ")
-			for j := 0; j < 16 && i+j < len(data); j++ {
-				c := data[i+j]
-				if c >= 32 && c <= 126 {
-					fmt.Printf("%c", c)
-				} else {
-					fmt.Print(".")
-				}
-			}
-			fmt.Println()
-		}
-		fmt.Printf("%0*o\n", addrWidth, len(data))
+		allData = append(allData, data...)
 	}
+
+	if len(allData) == 0 && exitCode == 0 && len(files) > 0 {
+		return 0
+	}
+
+	// Determine word size and format function
+	type odDumper struct {
+		wordSize int
+		dump     func([]byte, int, int)
+	}
+
+	var dumper odDumper
+
+	switch typeFlag {
+	case 0, 'B', 'o':
+		dumper = odDumper{2, odDumpOctal2}
+	case 'b':
+		dumper = odDumper{1, odDumpOctal1}
+	case 'c':
+		dumper = odDumper{1, odDumpChar}
+	case 'a':
+		dumper = odDumper{1, odDumpNamed}
+	case 'd':
+		dumper = odDumper{2, odDumpUnsigned2}
+	case 'D':
+		dumper = odDumper{4, odDumpUnsigned4}
+	case 'h', 'x':
+		dumper = odDumper{2, odDumpHex2}
+	case 'H', 'X':
+		dumper = odDumper{4, odDumpHex4}
+	case 'i':
+		dumper = odDumper{4, odDumpSigned4}
+	case 'I', 'L', 'l':
+		dumper = odDumper{8, odDumpSigned8}
+	case 'O':
+		dumper = odDumper{4, odDumpOctal4}
+	case 's':
+		dumper = odDumper{2, odDumpSigned2}
+	case 'e', 'F':
+		dumper = odDumper{8, odDumpDouble}
+	case 'f':
+		dumper = odDumper{4, odDumpFloat}
+	default:
+		// Unknown flag, fallback to default
+		dumper = odDumper{2, odDumpOctal2}
+	}
+
+	addrWidth := 7
+	if len(allData) > 0xFFFFFFF {
+		addrWidth = 11
+	}
+
+	wordsPerLine := 16 / dumper.wordSize
+
+	for i := 0; i < len(allData); i += dumper.wordSize * wordsPerLine {
+		fmt.Printf("%0*o", addrWidth, i)
+		dumper.dump(allData, i, wordsPerLine)
+		fmt.Println()
+	}
+	fmt.Printf("%0*o\n", addrWidth, len(allData))
+
 	return exitCode
+}
+
+// od format dumpers
+
+func odDumpOctal1(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j
+		if idx < len(data) {
+			fmt.Printf(" %03o", data[idx])
+		}
+	}
+}
+
+func odDumpOctal2(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j*2
+		if idx+1 < len(data) {
+			w := binary.LittleEndian.Uint16(data[idx:])
+			fmt.Printf(" %06o", w)
+		} else if idx < len(data) {
+			// Odd byte at end
+			fmt.Printf(" %06o", uint16(data[idx]))
+		}
+	}
+}
+
+func odDumpOctal4(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j*4
+		if idx+3 < len(data) {
+			w := binary.LittleEndian.Uint32(data[idx:])
+			fmt.Printf(" %011o", w)
+		}
+	}
+}
+
+func odDumpChar(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j
+		if idx < len(data) {
+			b := data[idx]
+			s := odCharFormat(b)
+			fmt.Printf(" %3s", s)
+		}
+	}
+}
+
+func odCharFormat(b byte) string {
+	switch b {
+	case 0:
+		return "\\0"
+	case 7:
+		return "\\a"
+	case 8:
+		return "\\b"
+	case 12:
+		return "\\f"
+	case 10:
+		return "\\n"
+	case 13:
+		return "\\r"
+	case 9:
+		return "\\t"
+	case 11:
+		return "\\v"
+	}
+	if b >= 32 && b <= 126 {
+		return "  " + string(rune(b))
+	}
+	return fmt.Sprintf("%03o", b)
+}
+
+func odDumpNamed(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j
+		if idx < len(data) {
+			s := odNamedFormat(data[idx])
+			fmt.Printf(" %3s", s)
+		}
+	}
+}
+
+var odNames = []string{
+	"nul", "soh", "stx", "etx", "eot", "enq", "ack", "bel",
+	"bs", "ht", "nl", "vt", "ff", "cr", "so", "si",
+	"dle", "dc1", "dc2", "dc3", "dc4", "nak", "syn", "etb",
+	"can", "em", "sub", "esc", "fs", "gs", "rs", "us",
+}
+
+func odNamedFormat(b byte) string {
+	// DESKTOP: high bytes wrap via & 0x7f
+	b = b & 0x7f
+	if b == 127 {
+		return "del"
+	}
+	if int(b) >= len(odNames) {
+		return "  " + string(rune(b))
+	}
+	return odNames[b]
+}
+
+func odDumpUnsigned2(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j*2
+		if idx+1 < len(data) {
+			w := binary.LittleEndian.Uint16(data[idx:])
+			fmt.Printf(" %5d", w)
+		}
+	}
+}
+
+func odDumpUnsigned4(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j*4
+		if idx+3 < len(data) {
+			w := binary.LittleEndian.Uint32(data[idx:])
+			fmt.Printf(" %10d", w)
+		}
+	}
+}
+
+func odDumpSigned2(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j*2
+		if idx+1 < len(data) {
+			w := int16(binary.LittleEndian.Uint16(data[idx:]))
+			fmt.Printf(" %5d", w)
+		}
+	}
+}
+
+func odDumpSigned4(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j*4
+		if idx+3 < len(data) {
+			w := int32(binary.LittleEndian.Uint32(data[idx:]))
+			fmt.Printf(" %11d", w)
+		}
+	}
+}
+
+func odDumpSigned8(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j*8
+		if idx+7 < len(data) {
+			w := int64(binary.LittleEndian.Uint64(data[idx:]))
+			fmt.Printf(" %20d", w)
+		}
+	}
+}
+
+func odDumpHex2(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j*2
+		if idx+1 < len(data) {
+			w := binary.LittleEndian.Uint16(data[idx:])
+			fmt.Printf(" %04x", w)
+		}
+	}
+}
+
+func odDumpHex4(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j*4
+		if idx+3 < len(data) {
+			w := binary.LittleEndian.Uint32(data[idx:])
+			fmt.Printf(" %08x", w)
+		}
+	}
+}
+
+func odDumpFloat(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j*4
+		if idx+3 < len(data) {
+			w := math.Float32frombits(binary.LittleEndian.Uint32(data[idx:]))
+			fmt.Printf(" %15.7e", w)
+		}
+	}
+}
+
+func odDumpDouble(data []byte, offset int, wordsPerLine int) {
+	for j := 0; j < wordsPerLine; j++ {
+		idx := offset + j*8
+		if idx+7 < len(data) {
+			w := math.Float64frombits(binary.LittleEndian.Uint64(data[idx:]))
+			fmt.Printf(" %23.15e", w)
+		}
+	}
 }
 
 func stringsMain(args []string) int {
@@ -1451,31 +1941,378 @@ func stringsMain(args []string) int {
 
 func printfMain(args []string) int {
 	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "gobox: printf: missing operand")
+		fmt.Fprintln(os.Stderr, "printf: missing operand")
 		return 1
 	}
 
 	format := args[1]
 	rest := args[2:]
+	convErr := false
 
-	// Handle %s, %d, %f etc. - simple implementation
-	// Replace escape sequences
-	format = strings.ReplaceAll(format, "\\n", "\n")
-	format = strings.ReplaceAll(format, "\\t", "\t")
-	format = strings.ReplaceAll(format, "\\\\", "\\")
-
-	if strings.Contains(format, "%") && len(rest) > 0 {
-		// Simple printf
-		argsI := make([]interface{}, len(rest))
-		for i, a := range rest {
-			argsI[i] = a
-		}
-		format = strings.ReplaceAll(format, "%s", "%v")
-		fmt.Printf(format, argsI...)
+	if len(rest) == 0 {
+		printfFormat(format, []string{}, &convErr)
 	} else {
-		fmt.Print(format)
+		for len(rest) > 0 {
+			rest = printfFormat(format, rest, &convErr)
+		}
+	}
+
+	if convErr {
+		return 1
 	}
 	return 0
+}
+
+// parseBackslashEscape processes a backslash escape starting at f[0].
+// Returns the replacement character and number of bytes consumed from f.
+func parseBackslashEscape(f string) (string, int) {
+	if len(f) < 2 || f[0] != '\\' {
+		return string(f[0]), 1
+	}
+	switch f[1] {
+	case 'a':
+		return "\a", 2
+	case 'b':
+		return "\b", 2
+	case 'f':
+		return "\f", 2
+	case 'n':
+		return "\n", 2
+	case 'r':
+		return "\r", 2
+	case 't':
+		return "\t", 2
+	case 'v':
+		return "\v", 2
+	case '\\':
+		return "\\", 2
+	case '"':
+		return "\"", 2
+	case 'c':
+		return "", 2 // handled specially by caller
+	case '0':
+		// Octal: up to 3 digits
+		end := 2
+		for end < len(f) && end < 5 && f[end] >= '0' && f[end] <= '7' {
+			end++
+		}
+		if end == 2 {
+			return "\x00", 2
+		}
+		val := 0
+		for j := 2; j < end; j++ {
+			val = val*8 + int(f[j]-'0')
+		}
+		return string([]byte{byte(val)}), end
+	case 'x':
+		// Hex: up to 3 digits (or more)
+		end := 2
+		for end < len(f) && ((f[end] >= '0' && f[end] <= '9') ||
+			(f[end] >= 'a' && f[end] <= 'f') ||
+			(f[end] >= 'A' && f[end] <= 'F')) {
+			end++
+		}
+		if end == 2 {
+			return "x", 2
+		}
+		val := 0
+		for j := 2; j < end; j++ {
+			c := f[j]
+			if c >= '0' && c <= '9' {
+				val = val*16 + int(c-'0')
+			} else if c >= 'a' && c <= 'f' {
+				val = val*16 + int(c-'a'+10)
+			} else {
+				val = val*16 + int(c-'A'+10)
+			}
+		}
+		return string([]byte{byte(val)}), end
+	}
+	return "\\"+string(f[1]), 2
+}
+
+// printEscString handles %b: print argument with backslash escapes.
+// Returns true if \c was found (stop output).
+func printEscString(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) && s[i+1] == 'c' {
+			return true
+		}
+		if s[i] == '\\' {
+			esc, n := parseBackslashEscape(s[i:])
+			fmt.Print(esc)
+			i += n - 1
+		} else {
+			fmt.Print(string(s[i]))
+		}
+	}
+	return false
+}
+
+// parseLongLong parses a string as int64. Handles leading +.
+// Returns value and whether parsing was successful.
+func parseLongLong(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if len(s) > 0 && s[0] == '+' {
+		s = s[1:]
+	}
+	n, err := strconv.ParseInt(s, 0, 64)
+	if err != nil {
+		// Try unsigned for negative hex/octal like "-2" -> fffffffffffffffe
+		u, err2 := strconv.ParseUint(s, 0, 64)
+		if err2 == nil {
+			return int64(u), true
+		}
+		fmt.Fprintf(os.Stderr, "printf: invalid number '%s'\n", s)
+		return 0, false
+	}
+	return n, true
+}
+
+// parseULongLong parses a string as uint64. Handles leading +.
+// Returns value and whether parsing was successful.
+func parseULongLong(s string) (uint64, bool) {
+	s = strings.TrimSpace(s)
+	if len(s) > 0 && s[0] == '+' {
+		s = s[1:]
+	}
+	n, err := strconv.ParseUint(s, 0, 64)
+	if err != nil {
+		// Try signed for negative values
+		si, err2 := strconv.ParseInt(s, 0, 64)
+		if err2 == nil {
+			return uint64(si), true
+		}
+		return 0, false
+	}
+	return n, true
+}
+
+// parseDouble parses a string as float64.
+// Returns value and whether parsing was successful.
+func parseDouble(s string) (float64, bool) {
+	s = strings.TrimSpace(s)
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0.0, false
+	}
+	return n, true
+}
+
+// parseWidthPrec parses a width or precision string.
+// Returns the integer value, or 0 on error.
+func parseWidthPrec(s string) int {
+	if s == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// printfFormat processes one format string against args. Returns remaining args.
+// If no args remain and format has % directives, empty strings are used.
+func printfFormat(f string, args []string, convErr *bool) []string {
+	argIdx := 0
+
+	for i := 0; i < len(f); i++ {
+		c := f[i]
+
+		if c == '\\' {
+			if i+1 < len(f) && f[i+1] == 'c' {
+				return nil
+			}
+			esc, n := parseBackslashEscape(f[i:])
+			fmt.Print(esc)
+			i += n - 1
+			continue
+		}
+
+		if c != '%' {
+			fmt.Print(string(c))
+			continue
+		}
+
+		i++
+		if i >= len(f) {
+			fmt.Fprintf(os.Stderr, "printf: %%%s: invalid format\n", "")
+			*convErr = true
+			return nil
+		}
+
+		if f[i] == '%' {
+			fmt.Print("%")
+			continue
+		}
+
+		if f[i] == 'b' {
+			if argIdx < len(args) {
+				if printEscString(args[argIdx]) {
+					return nil
+				}
+				argIdx++
+			}
+			continue
+		}
+
+		// Parse flags
+		flags := ""
+		for i < len(f) && strings.ContainsRune("-+ #0", rune(f[i])) {
+			flags += string(f[i])
+			i++
+		}
+
+		// Parse width
+		widthFromArg := false
+		widthVal := 0
+		if i < len(f) && f[i] == '*' {
+			widthFromArg = true
+			if argIdx < len(args) {
+				widthVal = parseWidthPrec(args[argIdx])
+				argIdx++
+			}
+			i++
+		} else {
+			for i < len(f) && f[i] >= '0' && f[i] <= '9' {
+				widthVal = widthVal*10 + int(f[i]-'0')
+				i++
+			}
+		}
+
+		// Parse precision
+		precFromArg := false
+		precVal := -1 // -1 means not set
+		if i < len(f) && f[i] == '.' {
+			i++
+			if i < len(f) && f[i] == '*' {
+				precFromArg = true
+				if argIdx < len(args) {
+					precVal = parseWidthPrec(args[argIdx])
+					argIdx++
+				}
+				// Negative precision = treat as not set
+				if precVal < 0 {
+					precFromArg = false
+					precVal = -1
+				}
+				i++
+			} else {
+				precVal = 0
+				for i < len(f) && f[i] >= '0' && f[i] <= '9' {
+					precVal = precVal*10 + int(f[i]-'0')
+					i++
+				}
+			}
+		}
+
+		// Skip length modifiers
+		for i < len(f) {
+			ch := f[i]
+			if ch == 'l' || ch == 'L' || ch == 'h' || ch == 'z' || ch == 't' {
+				i++
+			} else {
+				break
+			}
+		}
+
+		if i >= len(f) {
+			fmt.Fprintf(os.Stderr, "printf: %%%s: invalid format\n", "")
+			*convErr = true
+			return nil
+		}
+
+		formatChar := f[i]
+		validChars := "diouxXfeEgGcs"
+		if !strings.ContainsRune(validChars, rune(formatChar)) {
+			fmt.Fprintf(os.Stderr, "printf: %%%s: invalid format\n", string(formatChar))
+			*convErr = true
+			return nil
+		}
+
+		// Get value argument
+		arg := ""
+		if argIdx < len(args) {
+			arg = args[argIdx]
+			argIdx++
+		}
+
+		// Build Go format string (no "ll" - Go's fmt uses %d for all int types)
+		goFormat := "%" + flags
+		if widthFromArg {
+			goFormat += "*"
+		} else if widthVal > 0 {
+			goFormat += strconv.Itoa(widthVal)
+		}
+		if precVal >= 0 {
+			if precFromArg {
+				goFormat += ".*"
+			} else {
+				goFormat += "." + strconv.Itoa(precVal)
+			}
+		}
+		// Go's fmt doesn't support %i, use %d instead
+		goChar := formatChar
+		if goChar == 'i' {
+			goChar = 'd'
+		}
+		goFormat += string(goChar)
+
+		// Build args for Sprintf
+		var sprintArgs []interface{}
+		if widthFromArg {
+			sprintArgs = append(sprintArgs, widthVal)
+		}
+		if precFromArg {
+			sprintArgs = append(sprintArgs, precVal)
+		}
+
+		// Handle char prefix ('x) before numeric conversion
+		if strings.ContainsRune("diouxX", rune(formatChar)) {
+			trimArg := strings.TrimSpace(arg)
+			if len(trimArg) > 0 && (trimArg[0] == '\'' || trimArg[0] == '"') {
+				if len(trimArg) > 1 {
+					arg = fmt.Sprintf("%d", trimArg[1])
+				} else {
+					arg = "0"
+				}
+			}
+		}
+
+		switch formatChar {
+		case 'd', 'i':
+			val, ok := parseLongLong(arg)
+			if !ok {
+				*convErr = true
+			}
+			sprintArgs = append(sprintArgs, val)
+		case 'o', 'u', 'x', 'X':
+			val, ok := parseULongLong(arg)
+			if !ok {
+				*convErr = true
+			}
+			sprintArgs = append(sprintArgs, val)
+		case 'f', 'e', 'E', 'g', 'G':
+			val, ok := parseDouble(arg)
+			if !ok {
+				*convErr = true
+			}
+			sprintArgs = append(sprintArgs, val)
+		case 's':
+			sprintArgs = append(sprintArgs, arg)
+		case 'c':
+			if len(arg) > 0 {
+				sprintArgs = append(sprintArgs, arg[0])
+			} else {
+				sprintArgs = append(sprintArgs, 0)
+			}
+		}
+
+		fmt.Printf(goFormat, sprintArgs...)
+	}
+
+	return args[argIdx:]
 }
 
 func whichMain(args []string) int {

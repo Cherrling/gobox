@@ -3,7 +3,6 @@ package applets
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 )
@@ -198,5 +197,3 @@ func awkMain(args []string) int {
 	return 0
 }
 
-// Ensure io is used
-var _ = io.Discard

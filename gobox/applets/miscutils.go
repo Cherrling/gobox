@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -1384,8 +1383,6 @@ func runCommandExit(cmd *exec.Cmd) int {
 	return 0
 }
 
-// Dummy to satisfy sort import (used by netstat)
-var _ = sort.Strings
 
 // idMain - print user identity
 func idMain(args []string) int {

@@ -3,7 +3,6 @@ package applets
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -313,7 +312,6 @@ func rdateMain(args []string) int {
 	return 1
 }
 
-var _ = io.Discard
 
 // acpidMain - ACPI daemon
 func acpidMain(args []string) int {

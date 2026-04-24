@@ -568,9 +568,6 @@ func sortMain(args []string) int {
 		"jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
 	}
 
-	// Human-readable suffix values
-		_ = map[string]float64{} // placeholder
-
 	// Extract key from a line for comparison
 	extractKey := func(text string, ks keySpec) string {
 		// Split into fields
@@ -699,13 +696,6 @@ func sortMain(args []string) int {
 				}
 				return 1
 			}
-			if av < bv {
-				return -1
-			}
-			if av > bv {
-				return 1
-			}
-			return 0
 			if av < bv {
 				return -1
 			}

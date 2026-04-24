@@ -1278,15 +1278,9 @@ func unameMain(args []string) int {
 }
 
 func runtimeArch() string {
-	// Read /proc/self/exe or use go runtime
 	data, err := os.ReadFile("/proc/sys/kernel/arch")
 	if err == nil {
 		return strings.TrimSpace(string(data))
-	}
-	// Fallback to reading /proc/self/exe
-	link, err := os.Readlink("/proc/self/exe")
-	if err == nil {
-		_ = link
 	}
 	return "x86_64"
 }
@@ -2453,7 +2447,6 @@ func exprMain(args []string) int {
 
 func reniceMain(args []string) int {
 	delta := false
-	_ = 0 // unused
 	which := syscall.PRIO_PROCESS
 	start := 1
 

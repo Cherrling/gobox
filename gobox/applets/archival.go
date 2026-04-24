@@ -42,14 +42,21 @@ func tarMain(args []string) int {
 	extract := false
 	list := false
 	compress := false
+	verbose := false
 	file := ""
 	dir := ""
 	paths := []string{}
 
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
-		if strings.HasPrefix(arg, "-") {
-			for _, c := range arg[1:] {
+		flags := arg
+		if strings.HasPrefix(flags, "-") {
+			flags = flags[1:]
+		}
+		if len(flags) > 0 && strings.IndexFunc(flags, func(r rune) bool {
+			return r != 'c' && r != 'x' && r != 't' && r != 'z' && r != 'v' && r != 'f' && r != 'C'
+		}) == -1 {
+			for _, c := range flags {
 				switch c {
 				case 'c':
 					create = true
@@ -59,6 +66,8 @@ func tarMain(args []string) int {
 					list = true
 				case 'z':
 					compress = true
+				case 'v':
+					verbose = true
 				case 'f':
 					if i+1 < len(args) {
 						file = args[i+1]
@@ -80,68 +89,35 @@ func tarMain(args []string) int {
 		return tarCreate(file, paths, compress)
 	}
 	if extract {
-		return tarExtract(file, dir, compress)
+		return tarExtract(file, dir, compress, verbose)
 	}
 	if list {
 		return tarList(file, compress)
 	}
 
-	fmt.Fprintln(os.Stderr, "gobox: tar: need one of -c, -x, -t")
+	fmt.Fprintln(os.Stderr, "tar: need one of -c, -x, -t")
 	return 1
 }
 
 func tarCreate(tarFile string, paths []string, compress bool) int {
 	if len(paths) == 0 {
-		fmt.Fprintln(os.Stderr, "gobox: tar: no files to archive")
+		fmt.Fprintln(os.Stderr, "tar: no files to archive")
 		return 1
 	}
 
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 
+	type inodeKey struct {
+		dev uint64
+		ino uint64
+	}
+	seenInodes := make(map[inodeKey]string)
+
 	for _, path := range paths {
-		// Sanitize path: strip /../ components
-		cleanPath := path
-		sawDotDot := false
-		for strings.Contains(cleanPath, "/../") || strings.HasPrefix(cleanPath, "../") {
-			sawDotDot = true
-			if strings.HasPrefix(cleanPath, "../") {
-				cleanPath = cleanPath[3:]
-			} else {
-				idx := strings.Index(cleanPath, "/../")
-				if idx >= 0 {
-					// Remove the component before /../
-					prevSlash := strings.LastIndex(cleanPath[:idx], "/")
-					if prevSlash >= 0 {
-						cleanPath = cleanPath[:prevSlash] + cleanPath[idx+3:]
-					} else {
-						cleanPath = cleanPath[idx+4:]
-					}
-				}
-			}
-		}
-		if sawDotDot {
-			fmt.Fprintf(os.Stderr, "tar: removing leading '%s' from member names\n", strings.Replace(path, cleanPath, "..", 1))
-			// Actually, we need to extract the stripped prefix
-			// The prefix is everything that was removed
-			prefix := path
-			if strings.HasPrefix(path, "./") {
-				prefix = prefix[2:]
-			}
-			if strings.HasSuffix(cleanPath, "/") {
-				cleanPath = cleanPath[:len(cleanPath)-1]
-			}
-			// Find the actual prefix that was removed
-			if idx := strings.LastIndex(path, cleanPath); idx > 0 {
-				prefix = path[:idx]
-			} else {
-				prefix = path
-			}
-			// Remove leading/trailing slashes for the warning
-			prefix = strings.Trim(prefix, "/")
-			if prefix != "" {
-				fmt.Fprintf(os.Stderr, "tar: removing leading '%s/' from member names\n", prefix)
-			}
+		cleanPath, prefix := sanitizeTarPath(path)
+		if prefix != "" {
+			fmt.Fprintf(os.Stderr, "tar: removing leading '%s' from member names\n", prefix)
 		}
 		path = cleanPath
 
@@ -150,26 +126,51 @@ func tarCreate(tarFile string, paths []string, compress bool) int {
 				return err
 			}
 
-			// Sanitize relative path
 			relPath := filePath
 			relPath = strings.TrimPrefix(relPath, "./")
 
 			var linkTarget string
 			var header *tar.Header
 
-			if info.Mode()&os.ModeSymlink != 0 {
-				linkTarget, err = os.Readlink(filePath)
-				if err != nil {
-					return err
+			isHardlink := false
+			if !info.IsDir() {
+				if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
+					key := inodeKey{dev: stat.Dev, ino: stat.Ino}
+					if firstPath, seen := seenInodes[key]; seen {
+						isHardlink = true
+						header, err = tar.FileInfoHeader(info, "")
+						if err != nil {
+							return err
+						}
+						header.Typeflag = tar.TypeLink
+						header.Linkname = firstPath
+						header.Size = 0
+					} else {
+						seenInodes[key] = relPath
+					}
 				}
-				header, err = tar.FileInfoHeader(info, linkTarget)
-				if err != nil {
-					return err
-				}
-			} else {
-				header, err = tar.FileInfoHeader(info, "")
-				if err != nil {
-					return err
+			}
+
+			if !isHardlink {
+				if info.Mode()&os.ModeSymlink != 0 {
+					linkTarget, err = os.Readlink(filePath)
+					if err != nil {
+						return err
+					}
+					header, err = tar.FileInfoHeader(info, linkTarget)
+					if err != nil {
+						return err
+					}
+				} else if info.Mode().IsRegular() {
+					header, err = tar.FileInfoHeader(info, "")
+					if err != nil {
+						return err
+					}
+				} else {
+					header, err = tar.FileInfoHeader(info, "")
+					if err != nil {
+						return err
+					}
 				}
 			}
 
@@ -183,7 +184,7 @@ func tarCreate(tarFile string, paths []string, compress bool) int {
 				return err
 			}
 
-			if info.Mode().IsRegular() {
+			if info.Mode().IsRegular() && header.Typeflag != tar.TypeLink {
 				f, err := os.Open(filePath)
 				if err != nil {
 					return err
@@ -194,42 +195,85 @@ func tarCreate(tarFile string, paths []string, compress bool) int {
 			return nil
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+			fmt.Fprintf(os.Stderr, "tar: %v\n", err)
 			return 1
 		}
 	}
 	tw.Close()
 
-	if tarFile != "" {
+	if tarFile != "" && tarFile != "-" {
 		mode := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 		f, err := os.OpenFile(tarFile, mode, 0644)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+			fmt.Fprintf(os.Stderr, "tar: %v\n", err)
 			return 1
 		}
 		defer f.Close()
 		f.Write(buf.Bytes())
 	} else {
-		out := io.Writer(os.Stdout)
-		if compress {
-			gw := gzip.NewWriter(out.(io.WriteCloser))
-			gw.Write(buf.Bytes())
-			gw.Close()
-		} else {
-			os.Stdout.Write(buf.Bytes())
-		}
+		os.Stdout.Write(buf.Bytes())
 	}
 
 	return 0
 }
 
-func tarExtract(tarFile string, dir string, compress bool) int {
+func sanitizeTarPath(path string) (string, string) {
+	orig := path
+	path = strings.TrimPrefix(path, "./")
+
+	lastIdx := -1
+	for i := 0; i <= len(path)-2; i++ {
+		if path[i] == '.' && path[i+1] == '.' {
+			if i == 0 && (len(path) == 2 || path[i+2] == '/') {
+				lastIdx = i
+			} else if i > 0 && path[i-1] == '/' && (i+2 == len(path) || path[i+2] == '/') {
+				lastIdx = i - 1
+			}
+		}
+	}
+
+	if lastIdx < 0 {
+		return path, ""
+	}
+
+	end := lastIdx + 3
+	if lastIdx > 0 && path[lastIdx] == '/' {
+		end = lastIdx + 4
+	}
+	prefix := path[:end]
+	path = path[end:]
+
+	path = strings.TrimPrefix(path, "./")
+	if path == "" {
+		path = "."
+	}
+
+	prefixFromOrig := ""
+	if idx := strings.Index(orig, prefix); idx >= 0 {
+		prefixFromOrig = orig[:idx+len(prefix)]
+	}
+	return path, prefixFromOrig
+}
+
+func peekAndRead(r io.Reader) (io.Reader, error) {
+	buf := make([]byte, 1024)
+	n, err := io.ReadFull(r, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("short read")
+	}
+	return io.MultiReader(bytes.NewReader(buf[:n]), r), nil
+}
+
+func tarExtract(tarFile string, dir string, compress bool, verbose bool) int {
 	var r io.Reader
 
-	if tarFile != "" {
+	if tarFile != "" && tarFile != "-" {
 		f, err := os.Open(tarFile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+			fmt.Fprintf(os.Stderr, "tar: %v\n", err)
 			return 1
 		}
 		defer f.Close()
@@ -238,10 +282,17 @@ func tarExtract(tarFile string, dir string, compress bool) int {
 		r = os.Stdin
 	}
 
+	peeked, err := peekAndRead(r)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "tar: short read")
+		return 1
+	}
+	r = peeked
+
 	if compress {
 		gr, err := gzip.NewReader(r)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+			fmt.Fprintf(os.Stderr, "tar: %v\n", err)
 			return 1
 		}
 		defer gr.Close()
@@ -250,34 +301,21 @@ func tarExtract(tarFile string, dir string, compress bool) int {
 
 	tr := tar.NewReader(r)
 
-	// Check for empty input (not a tarball)
+	type dirPerm struct {
+		path string
+		mode os.FileMode
+	}
+	var dirs []dirPerm
+
 	header, err := tr.Next()
 	if err == io.EOF {
-		// Check if there's any data at all
-		buf := make([]byte, 1)
-		var n int
-		if tarFile != "" {
-			f, _ := os.Open(tarFile)
-			if f != nil {
-				n, _ = f.Read(buf)
-				f.Close()
-			}
-		} else {
-			// Can't easily peek at stdin, assume empty
-			return 0
-		}
-		if n == 0 {
-			fmt.Fprintln(os.Stderr, "tar: short read")
-			return 1
-		}
 		return 0
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+		fmt.Fprintf(os.Stderr, "tar: %v\n", err)
 		return 1
 	}
 
-	// Process the first header and continue with remaining
 	for {
 		target := header.Name
 		if dir != "" {
@@ -286,34 +324,53 @@ func tarExtract(tarFile string, dir string, compress bool) int {
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			os.MkdirAll(target, os.FileMode(header.Mode))
-			os.Chmod(target, os.FileMode(header.Mode))
+			os.MkdirAll(target, 0755)
+			dirs = append(dirs, dirPerm{target, os.FileMode(header.Mode)})
+			if verbose {
+				fmt.Println(header.Name)
+			}
 		case tar.TypeReg:
 			os.MkdirAll(filepath.Dir(target), 0755)
 			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+				fmt.Fprintf(os.Stderr, "tar: %v\n", err)
 				return 1
 			}
 			io.Copy(f, tr)
 			f.Close()
 			os.Chmod(target, os.FileMode(header.Mode))
+			if verbose {
+				fmt.Println(header.Name)
+			}
 		case tar.TypeSymlink:
 			os.MkdirAll(filepath.Dir(target), 0755)
 			os.Remove(target)
 			if err := os.Symlink(header.Linkname, target); err != nil {
-				fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+				fmt.Fprintf(os.Stderr, "tar: %v\n", err)
 				return 1
+			}
+			if verbose {
+				fmt.Println(header.Name)
 			}
 		case tar.TypeLink:
 			linkTarget := header.Linkname
 			if dir != "" {
 				linkTarget = filepath.Join(dir, linkTarget)
 			}
+			if linkTarget == target {
+				if verbose {
+					fmt.Println(header.Name)
+				}
+				break
+			}
 			os.MkdirAll(filepath.Dir(target), 0755)
+			os.Remove(target)
 			if err := os.Link(linkTarget, target); err != nil {
-				fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+				fmt.Fprintf(os.Stderr, "tar: %v\n", err)
 				return 1
+			}
+			if verbose {
+				fmt.Println(header.Name)
 			}
 		}
 
@@ -322,9 +379,13 @@ func tarExtract(tarFile string, dir string, compress bool) int {
 			break
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+			fmt.Fprintf(os.Stderr, "tar: %v\n", err)
 			return 1
 		}
+	}
+
+	for i := len(dirs) - 1; i >= 0; i-- {
+		os.Chmod(dirs[i].path, dirs[i].mode)
 	}
 	return 0
 }
@@ -335,7 +396,7 @@ func tarList(tarFile string, compress bool) int {
 	if tarFile != "" {
 		f, err := os.Open(tarFile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+			fmt.Fprintf(os.Stderr, "tar: %v\n", err)
 			return 1
 		}
 		defer f.Close()
@@ -344,10 +405,17 @@ func tarList(tarFile string, compress bool) int {
 		r = os.Stdin
 	}
 
+	peeked, err := peekAndRead(r)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "tar: short read")
+		return 1
+	}
+	r = peeked
+
 	if compress {
 		gr, err := gzip.NewReader(r)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gobox: tar: %v\n", err)
+			fmt.Fprintf(os.Stderr, "tar: %v\n", err)
 			return 1
 		}
 		defer gr.Close()
@@ -356,22 +424,8 @@ func tarList(tarFile string, compress bool) int {
 
 	tr := tar.NewReader(r)
 
-	// Check for empty input
 	header, err := tr.Next()
 	if err == io.EOF {
-		buf := make([]byte, 1)
-		var n int
-		if tarFile != "" {
-			f, _ := os.Open(tarFile)
-			if f != nil {
-				n, _ = f.Read(buf)
-				f.Close()
-			}
-		}
-		if n == 0 {
-			fmt.Fprintln(os.Stderr, "tar: short read")
-			return 1
-		}
 		return 0
 	}
 	if err != nil {
@@ -513,92 +567,74 @@ func zcatMain(args []string) int {
 	return 0
 }
 
-// bunzip2Main - decompress .bz2 files
 func bunzip2Main(args []string) int {
 	return execTool("bunzip2", args[1:])
 }
 
-// bzcatMain - decompress .bz2 to stdout
 func bzcatMain(args []string) int {
 	return execTool("bzcat", args[1:])
 }
 
-// bzip2Main - compress files with bzip2
 func bzip2Main(args []string) int {
 	return execTool("bzip2", args[1:])
 }
 
-// unlzmaMain - decompress .lzma files
 func unlzmaMain(args []string) int {
 	return execTool("unlzma", args[1:])
 }
 
-// lzcatMain - decompress .lzma to stdout
 func lzcatMain(args []string) int {
 	return execTool("lzcat", args[1:])
 }
 
-// lzmaMain - compress with lzma
 func lzmaMain(args []string) int {
 	return execTool("lzma", args[1:])
 }
 
-// unxzMain - decompress .xz files
 func unxzMain(args []string) int {
 	return execTool("unxz", args[1:])
 }
 
-// xzcatMain - decompress .xz to stdout
 func xzcatMain(args []string) int {
 	return execTool("xzcat", args[1:])
 }
 
-// xzMain - compress with xz
 func xzMain(args []string) int {
 	return execTool("xz", args[1:])
 }
 
-// uncompressMain - decompress .Z files
 func uncompressMain(args []string) int {
 	return execTool("uncompress", args[1:])
 }
 
-// cpioMain - copy files in/out of cpio archives
 func cpioMain(args []string) int {
 	return execTool("cpio", args[1:])
 }
 
-// arMain - create/extract ar archives
 func arMain(args []string) int {
 	return execTool("ar", args[1:])
 }
 
-// unzipMain - list/test/extract zip archives
 func unzipMain(args []string) int {
 	return execTool("unzip", args[1:])
 }
 
-// lzopMain - compress with lzop
 func lzopMain(args []string) int {
 	return execTool("lzop", args[1:])
 }
 
-// unlzopMain - decompress .lzo files
 func unlzopMain(args []string) int {
 	return execTool("unlzop", args[1:])
 }
 
-// lzopcatMain - decompress .lzo to stdout
 func lzopcatMain(args []string) int {
 	return execTool("lzopcat", args[1:])
 }
 
-// rpm2cpioMain - extract cpio archive from RPM
 func rpm2cpioMain(args []string) int {
 	return execTool("rpm2cpio", args[1:])
 }
 
-// execTool runs an external tool with args, passing stdin/stdout/stderr
 func execTool(tool string, args []string) int {
 	cmd := exec.Command(tool, args...)
 	cmd.Stdin = os.Stdin

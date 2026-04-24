@@ -459,7 +459,7 @@ func rmMain(args []string) int {
 
 	exitCode := 0
 	for _, path := range targets {
-		info, err := os.Stat(path)
+		info, err := os.Lstat(path)
 		if err != nil {
 			if force {
 				continue
@@ -766,6 +766,8 @@ func lsMain(args []string) int {
 
 	exitCode := 0
 	first := true
+	// Sort targets: non-directories first, then directories (like busybox)
+	var files, dirs []string
 	for _, path := range targets {
 		info, err := os.Stat(path)
 		if err != nil {
@@ -773,17 +775,30 @@ func lsMain(args []string) int {
 			exitCode = 1
 			continue
 		}
-		if !info.IsDir() {
-			// Single file
-			if long {
-				fmt.Println(formatFileInfo(path, info, human))
-			} else {
-				fmt.Println(info.Name())
-			}
+		if info.Mode()&os.ModeSymlink != 0 {
+			files = append(files, path)
+		} else if !info.IsDir() {
+			files = append(files, path)
+		} else {
+			dirs = append(dirs, path)
+		}
+	}
+	sort.Strings(files)
+	sort.Strings(dirs)
+
+	for _, path := range files {
+		info, err := os.Lstat(path)
+		if err != nil {
 			continue
 		}
-
-		err = lsDir(path, "", long, all, human, recursive, reverse, sortTime, sortSize, oneLine, &first, len(targets) > 1)
+		if long {
+			fmt.Println(formatFileInfo(path, info, human, path))
+		} else {
+			fmt.Println(info.Name())
+		}
+	}
+	for _, path := range dirs {
+		err := lsDir(path, "", long, all, human, recursive, reverse, sortTime, sortSize, oneLine, &first, len(dirs) > 1 || len(files) > 0)
 		if err != nil {
 			exitCode = 1
 		}
@@ -807,10 +822,11 @@ func lsDir(dirPath, prefix string, long, all, human, recursive, reverse, sortTim
 		if !all && strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		info, err := e.Info()
+		lstatInfo, err := os.Lstat(filepath.Join(dirPath, e.Name()))
 		if err != nil {
 			continue
 		}
+		info := lstatInfo
 		list = append(list, entry{e.Name(), info})
 	}
 
@@ -848,7 +864,7 @@ func lsDir(dirPath, prefix string, long, all, human, recursive, reverse, sortTim
 
 	if long {
 		for _, e := range list {
-			fmt.Println(formatFileInfo(filepath.Join(dirPath, e.name), e.info, human))
+			fmt.Println(formatFileInfo(filepath.Join(dirPath, e.name), e.info, human, e.name))
 		}
 	} else {
 		// Column output
@@ -876,7 +892,7 @@ func lsDir(dirPath, prefix string, long, all, human, recursive, reverse, sortTim
 	return nil
 }
 
-func formatFileInfo(path string, info os.FileInfo, human bool) string {
+func formatFileInfo(path string, info os.FileInfo, human bool, displayName string) string {
 	mode := info.Mode()
 	size := info.Size()
 	sizeStr := ""
@@ -894,21 +910,33 @@ func formatFileInfo(path string, info os.FileInfo, human bool) string {
 		}
 	}
 
-	// Get owner info from stat
+	// Get owner info from lstat (use stat for non-symlinks)
 	var stat syscall.Stat_t
 	uid := -1
 	gid := -1
-	if err := syscall.Stat(path, &stat); err == nil {
-		uid = int(stat.Uid)
-		gid = int(stat.Gid)
+	if info.Mode()&os.ModeSymlink != 0 {
+		if err := syscall.Lstat(path, &stat); err == nil {
+			uid = int(stat.Uid)
+			gid = int(stat.Gid)
+		}
+	} else {
+		if err := syscall.Stat(path, &stat); err == nil {
+			uid = int(stat.Uid)
+			gid = int(stat.Gid)
+		}
 	}
 
 	owner := userName(uid)
 	group := groupName(gid)
 
 	modTime := info.ModTime().Format("Jan _2 15:04")
+	// Use the path (not just base name) when it contains a directory separator
+	modeStr := mode.String()
+	if mode&os.ModeSymlink != 0 && len(modeStr) > 0 && modeStr[0] == 'L' {
+		modeStr = "l" + modeStr[1:]
+	}
 	return fmt.Sprintf("%s %3d %-8s %-8s %8s %s %s%s",
-		mode.String(), 1, owner, group, sizeStr, modTime, info.Name(), linkTarget)
+		modeStr, 1, owner, group, sizeStr, modTime, displayName, linkTarget)
 }
 
 func humanSize(size int64) string {

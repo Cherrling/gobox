@@ -646,6 +646,41 @@ func matchUser(name string) bool {
 	return true
 }
 
+// sedPatternToRE2 converts POSIX basic regex \( \) to Go RE2 ( )
+func sedPatternToRE2(s string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] == '\\' && i+1 < len(s) {
+			if s[i+1] == '(' || s[i+1] == ')' {
+				b.WriteByte(s[i+1])
+				i += 2
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// sedReplacementToRE2 converts \1 \2 etc. to $1 $2 for Go regexp replacement
+func sedReplacementToRE2(s string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] == '\\' && i+1 < len(s) && s[i+1] >= '0' && s[i+1] <= '9' {
+			b.WriteByte('$')
+			b.WriteByte(s[i+1])
+			i += 2
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
 func sedMain(args []string) int {
 	var script string
 	var inPlace string
@@ -701,6 +736,10 @@ func sedMain(args []string) int {
 		}
 	}
 
+	// Convert POSIX-style \( \) to Go RE2 ( ), and \1 \2 to $1 $2
+	searchStr = sedPatternToRE2(searchStr)
+	replaceStr = sedReplacementToRE2(replaceStr)
+
 	exitCode := 0
 	for _, path := range paths {
 		var data []byte
@@ -716,7 +755,7 @@ func sedMain(args []string) int {
 			continue
 		}
 
-		re, err := regexp.Compile(searchStr)
+		re, err := regexp.Compile("(?m)" + searchStr)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gobox: sed: invalid pattern: %s\n", err)
 			return 1
@@ -726,14 +765,18 @@ func sedMain(args []string) int {
 		if global {
 			result = re.ReplaceAllString(string(data), replaceStr)
 		} else {
-			result = re.ReplaceAllStringFunc(string(data), func(match string) string {
-				if result == "" {
-					return re.ReplaceAllString(match, replaceStr)
+			// sed processes line by line, replacing first match per line
+			lines := strings.SplitAfter(string(data), "\n")
+			for _, line := range lines {
+				loc := re.FindStringIndex(line)
+				if loc != nil {
+					before := line[:loc[0]]
+					match := re.ReplaceAllString(line[loc[0]:loc[1]], replaceStr)
+					after := line[loc[1]:]
+					result += before + match + after
+				} else {
+					result += line
 				}
-				return match
-			})
-			if result == "" {
-				result = string(data)
 			}
 		}
 
